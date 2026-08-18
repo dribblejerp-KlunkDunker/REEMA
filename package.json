@@ -15,7 +15,7 @@
     "messenger": "node tools/messenger.mjs"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=20.19.0"
   },
   "dependencies": {
     "@noble/post-quantum": "^0.6.1",
