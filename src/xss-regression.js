@@ -27,9 +27,7 @@
  * port. Skips gracefully (exit 0) when the headless browser is not resolvable.
  */
 import { spawn } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { existsSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { resolveChromium } from './chromium.js';
 
 const UI_PORT = Number(process.env.XSS_UI_PORT || 8019);
 const UI_URL = `http://127.0.0.1:${UI_PORT}/`;
@@ -39,31 +37,6 @@ const check = (label, cond, detail = '') => {
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${label}${detail ? ` (${detail})` : ''}`);
   if (!cond) failures++;
 };
-
-// Resolve patchright the same way browser-e2e.js does (it ships inside the
-// CodeGPT extension; there is no npm dependency to install).
-function resolveChromium() {
-  const bases = [
-    'C:/Users/dribb/.vscode/extensions/',
-    'C:/Users/dribb/.vscode-insiders/extensions/',
-  ];
-  const roots = [];
-  for (const base of bases) {
-    if (!existsSync(base)) continue;
-    const dirs = readdirSync(base)
-      .filter((d) => d.startsWith('danielsanmedium.dscodegpt-'))
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
-    if (dirs.length) roots.push(join(base, dirs[dirs.length - 1], 'standalone') + '/');
-  }
-  for (const root of roots) {
-    try {
-      const mod = createRequire(root)('patchright');
-      const chromium = mod?.chromium ?? mod?.default?.chromium;
-      if (chromium) return chromium;
-    } catch { /* try next */ }
-  }
-  return null;
-}
 
 async function waitForHttp(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -114,7 +87,7 @@ function benignPayload() {
 async function main() {
   const chromium = resolveChromium();
   if (!chromium) {
-    console.log('[xss-regression] SKIP: headless browser (patchright) not resolvable — install the CodeGPT extension to enable this test.');
+    console.log('[xss-regression] SKIP: headless browser (patchright) not resolvable — install the CodeGPT extension, or add patchright plus `npx patchright install chromium`, to enable this test.');
     return;
   }
 

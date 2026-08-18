@@ -15,9 +15,7 @@
  */
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { createRequire } from 'node:module';
-import { existsSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { resolveChromium } from './chromium.js';
 
 const RELAY_PORT = Number(process.env.M_RELAY_PORT || 7996);
 const WS_PORT = Number(process.env.M_WS_PORT || 8096);
@@ -51,27 +49,9 @@ async function waitForHttp(url, ms) {
   throw new Error('ui timeout ' + url);
 }
 
-// Resolve patchright the same way browser-e2e.js does (it ships inside the
-// CodeGPT extension; there is no npm dependency to install).
-function resolveChromium() {
-  const bases = ['C:/Users/dribb/.vscode/extensions/', 'C:/Users/dribb/.vscode-insiders/extensions/'];
-  for (const base of bases) {
-    if (!existsSync(base)) continue;
-    const dirs = readdirSync(base).filter((d) => d.startsWith('danielsanmedium.dscodegpt-'))
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
-    if (!dirs.length) continue;
-    try {
-      const mod = createRequire(join(base, dirs[dirs.length - 1], 'standalone') + '/')('patchright');
-      const c = mod?.chromium ?? mod?.default?.chromium;
-      if (c) return c;
-    } catch { /* try next */ }
-  }
-  return null;
-}
-
 const chromium = resolveChromium();
 if (!chromium) {
-  console.log('[messenger-smoke] SKIP: headless browser (patchright) not resolvable — install the CodeGPT extension to enable this test.');
+  console.log('[messenger-smoke] SKIP: headless browser (patchright) not resolvable — install the CodeGPT extension, or add patchright plus `npx patchright install chromium`, to enable this test.');
   process.exit(0);
 }
 

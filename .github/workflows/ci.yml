@@ -28,9 +28,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # The headless browser stages (browser-e2e, xss-regression,
-      # messenger-smoke) skip gracefully when the patchright/CodeGPT extension
-      # is absent, so they still exit 0 here; the Node-only stages run in full.
+      # Download patchright's Chromium and its system libraries so the
+      # headless browser stages (browser-e2e, xss-regression, messenger-smoke)
+      # run for real instead of skipping.
+      - name: Install headless Chromium
+        run: npx patchright install --with-deps chromium
+
       - name: Run test suite
         run: npm test
 

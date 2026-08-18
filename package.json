@@ -24,5 +24,8 @@
     "ws": "^8.13.0"
   },
   "license": "MIT",
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "patchright": "^1.62.1"
+  }
 }

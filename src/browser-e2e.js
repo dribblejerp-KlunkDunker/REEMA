@@ -24,9 +24,7 @@
  */
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { createRequire } from 'node:module';
-import { existsSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { resolveChromium } from './chromium.js';
 import { init, Identity, Session, encodeBundle, decodeBundle, isReceipt } from './crypto.js';
 
 // Dedicated ports so the test never collides with dev servers (7980/8080/8000)
@@ -105,31 +103,6 @@ function withTimeout(label, p, ms = 30000) {
   ]);
 }
 
-// Resolve patchright the same way the browser-automation skill does (it ships
-// inside the CodeGPT extension; there is no npm dependency to install).
-function resolveChromium() {
-  const bases = [
-    'C:/Users/dribb/.vscode/extensions/',
-    'C:/Users/dribb/.vscode-insiders/extensions/',
-  ];
-  const roots = [];
-  for (const base of bases) {
-    if (!existsSync(base)) continue;
-    const dirs = readdirSync(base)
-      .filter((d) => d.startsWith('danielsanmedium.dscodegpt-'))
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
-    if (dirs.length) roots.push(join(base, dirs[dirs.length - 1], 'standalone') + '/');
-  }
-  for (const root of roots) {
-    try {
-      const mod = createRequire(root)('patchright');
-      const chromium = mod?.chromium ?? mod?.default?.chromium;
-      if (chromium) return chromium;
-    } catch { /* try next */ }
-  }
-  return null;
-}
-
 async function main() {
   const sodium = await init();
   const ORIG = sodium.base64_variants.ORIGINAL;
@@ -137,7 +110,7 @@ async function main() {
 
   const chromium = resolveChromium();
   if (!chromium) {
-    console.log('[browser-e2e] SKIP: headless browser (patchright) not resolvable — install the CodeGPT extension to enable this test.');
+    console.log('[browser-e2e] SKIP: headless browser (patchright) not resolvable — install the CodeGPT extension, or add patchright plus `npx patchright install chromium`, to enable this test.');
     return;
   }
 
