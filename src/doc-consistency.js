@@ -61,10 +61,16 @@ async function main() {
   const PATH_RE = /^(src|public|tools|scratch)\/[\w./-]+\.(js|mjs|html|json|md)$/;
   const DIR_RE = /^(src|public|tools|scratch)\/[\w./-]+\/$/;
   const ROOT_FILES = new Set(['package.json', '.gitignore', 'README.md', 'ROADMAP.md']);
-  // Runtime artifacts gitignored by design — they should not exist in a fresh
-  // clone, so verify they are listed in .gitignore instead of on disk.
+  // Runtime artifacts that exist only in a developer's working tree, never in
+  // a fresh clone: known root files plus anything under a gitignored directory
+  // (scratch/, node_modules/). For these, verify the .gitignore entry instead
+  // of requiring the file on disk — otherwise the check fails in CI, where a
+  // clean checkout has no scratch/ files.
   const RUNTIME_ARTIFACTS = new Set(['.identity.json', '.sessions.json']);
   const gitignore = read('.gitignore');
+  const gitignoreLines = gitignore.split('\n').map((l) => l.trim()).filter(Boolean);
+  const gitignoredDirs = new Set(gitignoreLines.filter((l) => l.endsWith('/')).map((l) => l.slice(0, -1)));
+  const isGitignored = (p) => RUNTIME_ARTIFACTS.has(p) || gitignoredDirs.has(p.split('/')[0]);
   for (const file of DOCS) {
     const text = read(file);
     const cited = new Set();
@@ -74,8 +80,9 @@ async function main() {
       else if (DIR_RE.test(tok)) cited.add(tok);
     }
     for (const p of cited) {
-      if (RUNTIME_ARTIFACTS.has(p)) {
-        check(`${file}: ${p} is gitignored`, gitignore.split('\n').some((l) => l.trim() === p), '');
+      if (isGitignored(p)) {
+        const entry = RUNTIME_ARTIFACTS.has(p) ? p : `${p.split('/')[0]}/`;
+        check(`${file}: ${p} is gitignored`, gitignoreLines.includes(entry), '');
       } else {
         const target = p.endsWith('/') ? p.slice(0, -1) : p;
         check(`${file}: ${p} exists`, existsSync(target), existsSync(target) ? '' : 'MISSING');
