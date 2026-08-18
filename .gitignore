@@ -1,0 +1,8 @@
+# Private key material — never commit
+.identity.json
+# Encrypted session state (derived from the identity) — runtime artifact
+.sessions.json
+
+node_modules/
+scratch/
+*.log

@@ -1,0 +1,27 @@
+{
+  "name": "threema-style-e2ee-prototype",
+  "version": "1.0.0",
+  "description": "Threema-style end-to-end encrypted messaging prototype using libsodium (NaCl). Strong E2EE benchmark: X25519 ECDH + XChaCha20-Poly1305 + Ed25519. Includes a ciphertext-only relay server and optional auto-Tor routing.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "demo": "node src/demo.js",
+    "server": "node src/server.js",
+    "client": "node src/client.js",
+    "test": "node src/test.js && node src/fuzz.js && node src/browser-e2e.js && node src/xss-regression.js && node src/messenger-smoke.js && node src/doc-consistency.js",
+    "vendor": "node tools/vendor.mjs .",
+    "serve": "node tools/serve.mjs"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "@noble/post-quantum": "^0.6.1",
+    "libsodium-wrappers": "^0.7.15",
+    "socks": "^2.8.3",
+    "ws": "^8.13.0"
+  },
+  "license": "MIT",
+  "private": true
+}

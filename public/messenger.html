@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Messenger — v6 E2EE</title>
+<style>
+  :root { --bg:#141518; --panel:#1d1e23; --line:#2c2e36; --text:#e7e5e0; --dim:#8b8f99; --acc:#b68438; --ok:#6fbf8f; --bad:#cf6679; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif; }
+  #app { max-width:720px; margin:0 auto; padding:24px 16px; display:flex; flex-direction:column; gap:16px; min-height:100vh; }
+  h1 { font-size:18px; margin:0; letter-spacing:.04em; }
+  .muted { color:var(--dim); font-size:13px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12px; word-break:break-all; }
+  input, button { font:inherit; }
+  input[type=text] { flex:1; min-width:0; background:#0d0e10; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:10px 12px; }
+  input[type=text]:focus { outline:none; border-color:var(--acc); }
+  button { background:var(--acc); color:#141518; border:0; border-radius:6px; padding:10px 16px; font-weight:600; cursor:pointer; white-space:nowrap; }
+  button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line); }
+  button.ghost:hover { color:var(--text); border-color:var(--acc); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #status { font-size:13px; }
+  #status.on { color:var(--ok); }
+  #status.off { color:var(--bad); }
+  #feed { display:flex; flex-direction:column; gap:8px; min-height:220px; max-height:52vh; overflow-y:auto; }
+  .msg { max-width:78%; padding:9px 12px; border-radius:10px; background:#26282f; align-self:flex-start; }
+  .msg.sent { background:#3a3423; align-self:flex-end; }
+  .msg .t { font-size:14px; }
+  .msg .m { font-size:11px; color:var(--dim); margin-top:3px; }
+  .empty { color:var(--dim); text-align:center; padding:40px 0; }
+  .addressbox { display:flex; gap:8px; align-items:center; }
+  .addressbox .mono { flex:1; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="row">
+    <h1>Messenger <span class="muted">— protocol v6, post-quantum hybrid</span></h1>
+    <span id="status" class="off">RELAY: connecting…</span>
+  </div>
+
+  <div class="panel">
+    <div class="muted" style="margin-bottom:8px">Your bound routing address — share it (44 chars). Your peer's client resolves it via the relay's key directory.</div>
+    <div class="addressbox">
+      <span id="my-address" class="mono">…</span>
+      <button class="ghost" id="copy-addr">Copy</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="muted" style="margin-bottom:8px">Connect to a peer by their 44-char address (directory) or a full prekey bundle (offline).</div>
+    <div class="row">
+      <input type="text" id="peer-input" placeholder="peer address or prekey bundle" autocomplete="off">
+      <button id="connect">Connect</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div id="feed"><div class="empty">Connect to a peer to start. Either side may send first.</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <input type="text" id="msg-input" placeholder="Message (Enter to send)" autocomplete="off" disabled>
+      <button id="send" disabled>Send</button>
+    </div>
+  </div>
+
+  <div class="muted">
+    Relies on the ciphertext-only relay (<code>npm run server</code>) and this
+    static server (<code>npm run serve</code>). No plaintext or keys ever reach
+    the relay.
+  </div>
+</div>
+
+<script defer src="./vendor/libsodium/libsodium.js"></script>
+<script defer src="./vendor/libsodium/libsodium-wrappers.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "@noble/post-quantum/": "./vendor/@noble/post-quantum/",
+    "@noble/hashes/": "./vendor/@noble/hashes/",
+    "@noble/curves/": "./vendor/@noble/curves/"
+  }
+}
+</script>
+<script type="module">
+import { init, Identity, Session, decodeBundle, RECEIPT, isReceipt } from './browser-crypto.js';
+
+const OTK_POOL_SIZE = 20;
+const IDENTITY_KEY = 'messenger_identity';
+const SESSIONS_KEY = 'messenger_sessions';
+
+let sodium, myId, ws = null;
+let myPk = '', myAddress = '';
+let pendingDirectory = null;          // { resolve, reject } for fetch-directory
+let sessions = new Map();             // peerDhPkB64 -> Session
+const peerAddresses = new Map();      // peerDhPkB64 -> 44-char routing address
+let activePeer = null;                // peerDhPkB64
+let activeAddress = '';               // routing address of the active peer
+let activePeerBundle = '';            // original bundle string (for reconnect/reload)
+
+const $ = (id) => document.getElementById(id);
+const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
+const unb64 = (s) => sodium.from_base64(s, sodium.base64_variants.ORIGINAL);
+
+// ---- Identity (keys + one-time prekey pool) ----
+function persistIdentity() {
+  const otks = {};
+  for (const [id, kp] of myId.oneTimePrekeys) otks[id] = { dhSk: b64(kp.sk), dhPk: b64(kp.pk), signature: b64(kp.signature) };
+  localStorage.setItem(IDENTITY_KEY, JSON.stringify({
+    v: 6,
+    signSk: b64(myId.signSk), signPk: b64(myId.signPk),
+    dhSk: b64(myId.sk), dhPk: b64(myId.pk),
+    signedDhSk: b64(myId.signedDhSk), signedDhPk: b64(myId.signedDhPk),
+    kemSk: b64(myId.kemSk), kemPk: b64(myId.kemPk),
+    oneTimePrekeys: otks,
+  }));
+}
+
+function loadOrCreateIdentity() {
+  const saved = localStorage.getItem(IDENTITY_KEY);
+  if (saved) {
+    const d = JSON.parse(saved);
+    if (d.dhSk && d.signSk && d.signedDhSk && d.kemSk) {
+      myId = new Identity({
+        signSk: unb64(d.signSk), signPk: unb64(d.signPk),
+        sk: unb64(d.dhSk), pk: unb64(d.dhPk),
+        signedDhSk: unb64(d.signedDhSk), signedDhPk: unb64(d.signedDhPk),
+        kemSk: unb64(d.kemSk), kemPk: unb64(d.kemPk),
+      });
+      for (const [id, kp] of Object.entries(d.oneTimePrekeys || {})) {
+        myId.oneTimePrekeys.set(Number(id), { id: Number(id), sk: unb64(kp.dhSk), pk: unb64(kp.dhPk), signature: unb64(kp.signature) });
+      }
+    }
+  }
+  if (!myId) myId = new Identity();
+  myId.newOneTimePrekeys(OTK_POOL_SIZE);
+  persistIdentity();
+  myPk = b64(myId.pk);
+  myAddress = b64(Identity.deriveAddress(myId.signPk, myId.pk));
+}
+
+// ---- Session persistence (encrypted at rest) ----
+function sessionStoreKey() { return sodium.crypto_generichash(32, new Uint8Array(0), myId.sk); }
+function saveSessions() {
+  const data = {};
+  for (const [pk, s] of sessions) data[pk] = s.serialize();
+  const key = sessionStoreKey();
+  const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
+  const box = sodium.crypto_secretbox_easy(new TextEncoder().encode(JSON.stringify(data)), nonce, key);
+  localStorage.setItem(SESSIONS_KEY, JSON.stringify({ v: 1, nonce: b64(nonce), box: b64(box) }));
+}
+function loadSessions() {
+  const raw = localStorage.getItem(SESSIONS_KEY);
+  if (!raw) return;
+  try {
+    const { nonce, box } = JSON.parse(raw);
+    const key = sessionStoreKey();
+    const plain = sodium.crypto_secretbox_open_easy(unb64(box), unb64(nonce), key);
+    if (!plain) return;
+    const data = JSON.parse(sodium.to_string(plain));
+    for (const [pk, s] of Object.entries(data)) {
+      const sess = Session.restore(myId, s);
+      if (b64(sess.peerDhPk) !== pk) continue;
+      sessions.set(pk, sess);
+    }
+  } catch { /* tampered or rotated identity — start fresh */ }
+}
+
+// ---- Relay ----
+function publishToRelay() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const otks = [...myId.oneTimePrekeys.values()].map((k) => ({ id: k.id, dhPk: b64(k.pk), signature: b64(k.signature) }));
+  ws.send(JSON.stringify({ type: 'publish', address: myAddress, bundle: myId.makeBundle(), oneTimePrekeys: otks }));
+}
+function fetchDirectory(address) {
+  return new Promise((resolve, reject) => {
+    pendingDirectory = { resolve, reject };
+    ws.send(JSON.stringify({ type: 'fetch-directory', address }));
+  });
+}
+
+// ---- UI ----
+function setStatus(on, text) {
+  const el = $('status');
+  el.className = on ? 'on' : 'off';
+  el.textContent = `RELAY: ${text}`;
+}
+function addMessage(text, sent) {
+  const feed = $('feed');
+  const empty = feed.querySelector('.empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = 'msg' + (sent ? ' sent' : '');
+  const t = document.createElement('div'); t.className = 't'; t.textContent = text;
+  const m = document.createElement('div'); m.className = 'm'; m.textContent = sent ? 'sent' : 'received';
+  div.appendChild(t); div.appendChild(m);
+  feed.appendChild(div);
+  feed.scrollTop = feed.scrollHeight;
+}
+function setActive(pk, address, bundleStr) {
+  activePeer = pk;
+  activeAddress = address || '';
+  activePeerBundle = bundleStr || '';
+  if (activeAddress) peerAddresses.set(pk, activeAddress);
+  $('msg-input').disabled = false;
+  $('send').disabled = false;
+  $('peer-input').value = activePeerBundle || activeAddress || pk;
+}
+
+// ---- Send ----
+async function sendMessage() {
+  const text = $('msg-input').value.trim();
+  if (!text || !activePeer) return;
+
+  let peerPk = activePeer;
+  let toAddress = peerAddresses.get(peerPk) || activeAddress || '';
+
+  // First send to this peer: resolve their bundle (address via the directory,
+  // or a pasted bundle) and mint the session. Either side may send first.
+  if (!sessions.has(peerPk)) {
+    const raw = $('peer-input').value.trim();
+    if (!raw) { addMessage('⚠️ enter a peer address or bundle first', true); return; }
+    let bundle, peerOtk = null;
+    try {
+      if (raw.length === 44) {
+        const dir = await fetchDirectory(raw);
+        const peer = Identity.verifyBundle(dir.bundle);
+        bundle = dir.bundle;
+        toAddress = raw;
+        peerPk = b64(peer.staticDhPk);
+        if (dir.oneTimePrekey) {
+          if (!Identity.verifyOneTimePrekey(peer.signPk, dir.oneTimePrekey)) throw new Error('bad one-time prekey from directory');
+          peerOtk = dir.oneTimePrekey;
+        }
+      } else {
+        bundle = decodeBundle(raw);
+        const peer = Identity.verifyBundle(bundle);
+        toAddress = b64(Identity.deriveAddress(peer.signPk, peer.staticDhPk));
+        peerPk = b64(peer.staticDhPk);
+      }
+    } catch (e) { addMessage('⚠️ ' + e.message, true); return; }
+
+    if (peerPk === myPk) { addMessage('⚠️ that is your own address', true); return; }
+    sessions.set(peerPk, new Session(myId, bundle, peerOtk));
+    setActive(peerPk, toAddress, raw);
+  }
+
+  try {
+    const env = sessions.get(peerPk).encrypt(new TextEncoder().encode(text));
+    saveSessions(); // persist the ratchet state BEFORE the send is observable
+    ws.send(JSON.stringify({ type: 'send', toPk: toAddress, envelope: env, fromPk: myAddress }));
+    addMessage(text, true);
+    $('msg-input').value = '';
+  } catch (e) { addMessage('⚠️ ' + e.message, true); }
+}
+
+// ---- Receive ----
+function onMessage(msg) {
+  if (msg.type === 'directory') {
+    if (pendingDirectory) {
+      const p = pendingDirectory; pendingDirectory = null;
+      if (msg.error) p.reject(new Error(msg.error)); else p.resolve(msg);
+    }
+    return;
+  }
+  if (msg.type !== 'message') return;
+  let env;
+  try { env = typeof msg.envelope === 'string' ? JSON.parse(msg.envelope) : msg.envelope; }
+  catch { return; }
+
+  const senderPk = env.senderDhPk;
+  if (!senderPk) return;
+
+  let created = false;
+  let senderAddress = '';
+  try {
+    if (!sessions.has(senderPk)) {
+      // First contact: require a self-signed bundle that matches the sender.
+      if (env.header?.first !== true || !env.header?.bundle) throw new Error('no bundle on first contact');
+      const peer = Identity.verifyBundle(env.header.bundle);
+      if (b64(peer.staticDhPk) !== senderPk || b64(peer.signPk) !== env.senderSignPk) {
+        throw new Error('bundle does not match its envelope');
+      }
+      // Consume our one-time prekey if the sender used one, then burn it.
+      let peerOtk = null;
+      if (env.header.otk_id !== undefined) {
+        const otk = myId.oneTimePrekeys.get(env.header.otk_id);
+        if (!otk) throw new Error('unknown one-time prekey id');
+        peerOtk = { id: otk.id, sk: otk.sk, pk: otk.pk };
+        myId.oneTimePrekeys.delete(otk.id);
+        persistIdentity();
+        publishToRelay(); // republish the smaller pool
+      }
+      sessions.set(senderPk, new Session(myId, env.header.bundle, peerOtk));
+      // Remember the sender's routing address so replies route back to them.
+      senderAddress = b64(Identity.deriveAddress(peer.signPk, peer.staticDhPk));
+      created = true;
+      setActive(senderPk, senderAddress, '');
+    }
+
+    const session = sessions.get(senderPk);
+    const plaintext = session.decrypt(env);
+
+    // Delivery receipt: acknowledge a newly-established session so the sender's
+    // receiving chain is established even if it never replies by hand.
+    if (created && senderAddress) {
+      const receiptEnv = session.encrypt(new TextEncoder().encode(RECEIPT));
+      ws.send(JSON.stringify({ type: 'send', toPk: senderAddress, envelope: receiptEnv, fromPk: myAddress }));
+    }
+
+    if (!isReceipt(plaintext)) {
+      if (activePeer !== senderPk) setActive(senderPk, peerAddresses.get(senderPk) || '', '');
+      addMessage(plaintext, false);
+    }
+    saveSessions();
+  } catch (e) {
+    // Junk or undecryptable first contact: evict so it cannot accumulate.
+    if (sessions.has(senderPk)) sessions.delete(senderPk);
+  }
+}
+
+// ---- Boot ----
+async function main() {
+  sodium = await init();
+  loadOrCreateIdentity();
+  loadSessions();
+  $('my-address').textContent = myAddress;
+
+  $('copy-addr').onclick = () => navigator.clipboard?.writeText(myAddress).then(() => {
+    $('copy-addr').textContent = 'Copied'; setTimeout(() => $('copy-addr').textContent = 'Copy', 1500);
+  });
+  $('connect').onclick = async () => {
+    const raw = $('peer-input').value.trim();
+    if (!raw) return;
+    // Establish lazily on send (either side may send first). For an address,
+    // resolve the bundle now so we can show the active peer's key.
+    if (raw.length === 44) {
+      try {
+        const dir = await fetchDirectory(raw);
+        const peer = Identity.verifyBundle(dir.bundle);
+        setActive(b64(peer.staticDhPk), raw, raw);
+        addMessage('Connected to ' + raw.slice(0, 8) + '… — send a message to establish.', true);
+      } catch (e) { addMessage('⚠️ ' + e.message, true); }
+    } else {
+      try {
+        const bundle = decodeBundle(raw);
+        const peer = Identity.verifyBundle(bundle);
+        setActive(b64(peer.staticDhPk), b64(Identity.deriveAddress(peer.signPk, peer.staticDhPk)), raw);
+        addMessage('Connected from bundle — either side may send first.', true);
+      } catch { addMessage('⚠️ not a valid v6 address or bundle', true); }
+    }
+  };
+  $('send').onclick = sendMessage;
+  $('msg-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+
+  const relayParam = new URLSearchParams(location.search).get('relay');
+  const relayUrl = relayParam && /^ws:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(relayParam)
+    ? relayParam : 'ws://127.0.0.1:8080';
+  ws = new WebSocket(relayUrl);
+  ws.onopen = () => { setStatus(true, 'connected'); publishToRelay(); };
+  ws.onclose = () => setStatus(false, 'disconnected');
+  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch {} };
+}
+
+main().catch((e) => { setStatus(false, 'init failed: ' + e.message); console.error(e); });
+</script>
+</body>
+</html>

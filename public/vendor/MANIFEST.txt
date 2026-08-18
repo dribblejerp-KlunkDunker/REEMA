@@ -1,0 +1,18 @@
+Vendored from node_modules at build time. Regenerate with: npm run vendor
+
+@noble/curves/abstract/fft.js
+@noble/curves/abstract/modular.js
+@noble/curves/utils.js
+@noble/hashes/_md.js
+@noble/hashes/_u64.js
+@noble/hashes/hmac.js
+@noble/hashes/legacy.js
+@noble/hashes/sha2.js
+@noble/hashes/sha3.js
+@noble/hashes/utils.js
+@noble/post-quantum/_crystals.js
+@noble/post-quantum/ml-dsa.js
+@noble/post-quantum/ml-kem.js
+@noble/post-quantum/utils.js
+libsodium/libsodium-wrappers.js
+libsodium/libsodium.js
