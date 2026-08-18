@@ -128,9 +128,11 @@ never transmitted, binding each envelope to one conversation.
 │   ├── browser-crypto.js   # thin browser adapter over crypto-core.js
 │   ├── index.html     # dashboard UI with an E2EE Network tab
 │   ├── messenger.html # minimal two-party messaging app over the same core
+│   ├── fonts/         # self-hosted fonts (SIL OFL 1.1) + local fonts.css
 │   └── vendor/        # vendored libsodium + @noble — no CDN at runtime
 └── tools/
     ├── vendor.mjs     # regenerate public/vendor from node_modules
+    ├── fetch-fonts.mjs    # regenerate public/fonts from Google Fonts (latin subsets only)
     └── serve.mjs      # static server: brotli/gzip + cache headers (loopback only)
 ```
 
@@ -251,9 +253,12 @@ running.
   edge is closed.
 - **One crypto implementation** — Node and browser share a single core
   (`public/crypto-core.js`); a fix is a fix in both clients.
-- **No CDN** — all cryptography is served from `public/vendor/`. A CDN can serve
-  different bytes to different visitors; for a messaging app that means it can
-  serve a backdoored cipher.
+- **No CDN** — all cryptography is served from `public/vendor/`, and the UI's
+  fonts are self-hosted in `public/fonts/` (regenerate with `tools/fetch-fonts.mjs`;
+  every woff2 is verified against committed SHA-256 pins in `tools/fonts-manifest.json`,
+  so even the font CDN cannot silently substitute bytes).
+  A CDN can serve different bytes to different visitors; for a messaging app that
+  means it can serve a backdoored cipher.
 
 ## Limitations
 
