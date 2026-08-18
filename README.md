@@ -1,8 +1,14 @@
 # BlackVault-Reema — Post-Quantum E2EE Messaging Prototype
 
-A working, self-contained prototype of end-to-end encrypted messaging with a
-**post-quantum hybrid Double Ratchet**, a ciphertext-only relay, and both a
-Node CLI and a browser client that interoperate over the same wire format.
+[![CI](https://github.com/dribblejerp-KlunkDunker/REEMA/actions/workflows/ci.yml/badge.svg)](https://github.com/dribblejerp-KlunkDunker/REEMA/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+BlackVault-Reema is a self-contained, post-quantum end-to-end encrypted
+messaging prototype: a hybrid Double Ratchet (X25519 + ML-KEM-768 with
+ML-DSA-65 signatures), X3DH-style prekey bundles and a one-time-prekey key
+directory, a ciphertext-only relay, and interoperating Node CLI and browser
+clients — hardened by a mutation fuzzer, a real-relay integration suite, and
+headless browser E2E tests.
 
 > **What this proves:** the relay can *only ever see ciphertext*. It cannot read
 > messages, and it cannot forge them.
