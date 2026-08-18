@@ -1,7 +1,7 @@
-# Roadmap — Post-Quantum E2EE Prototype
+# BlackVault-Reema — Roadmap
 
 Consolidated findings and recommendations from the security review of the
-"Threema - Copy-Test-1" prototype, plus the v5 prekey-bundle and v6
+BlackVault-Reema prototype, plus the v5 prekey-bundle and v6
 key-directory overhauls. Status reflects the current state of the working tree.
 
 **Legend:** ✅ done · 🔜 next · 🟡 later · ⚠️ operational

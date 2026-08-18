@@ -1,7 +1,7 @@
 {
-  "name": "threema-style-e2ee-prototype",
+  "name": "blackvault-reema",
   "version": "1.0.0",
-  "description": "Threema-style end-to-end encrypted messaging prototype using libsodium (NaCl). Strong E2EE benchmark: X25519 ECDH + XChaCha20-Poly1305 + Ed25519. Includes a ciphertext-only relay server and optional auto-Tor routing.",
+  "description": "BlackVault-Reema — post-quantum end-to-end encrypted messaging prototype using libsodium (NaCl). Strong E2EE benchmark: X25519 ECDH + XChaCha20-Poly1305 + Ed25519. Includes a ciphertext-only relay server and optional auto-Tor routing.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -11,7 +11,8 @@
     "client": "node src/client.js",
     "test": "node src/test.js && node src/fuzz.js && node src/browser-e2e.js && node src/xss-regression.js && node src/messenger-smoke.js && node src/doc-consistency.js",
     "vendor": "node tools/vendor.mjs .",
-    "serve": "node tools/serve.mjs"
+    "serve": "node tools/serve.mjs",
+    "messenger": "node tools/messenger.mjs"
   },
   "engines": {
     "node": ">=16"

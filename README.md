@@ -1,4 +1,4 @@
-# Post-Quantum E2EE Messaging Prototype
+# BlackVault-Reema — Post-Quantum E2EE Messaging Prototype
 
 A working, self-contained prototype of end-to-end encrypted messaging with a
 **post-quantum hybrid Double Ratchet**, a ciphertext-only relay, and both a
@@ -159,6 +159,17 @@ a Node-vs-browser differential leg: a pure-Node peer and the browser peer
 exchange envelopes through the relay in both directions, proving the two
 stacks share one wire format. It points the page at its own relay via the
 `?relay=ws://host:port` query parameter.
+
+Browser client — one command (relay + static server + opens the messenger):
+
+```bash
+npm run messenger
+```
+
+Override the loopback ports with `MESSENGER_HOST`, `MESSENGER_RELAY_PORT`,
+`MESSENGER_WS_PORT`, or `MESSENGER_UI_PORT`. Ctrl+C stops both servers. Open a
+second profile (private/incognito window) at the printed URL for a two-party
+conversation.
 
 Browser client — three terminals:
 
