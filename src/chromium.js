@@ -45,16 +45,21 @@ export function resolveChromium() {
   for (const root of extensionRoots()) {
     try {
       const chromium = chromiumOf(createRequire(root)('patchright'));
-      if (chromium) return chromium;
+      if (chromium) { console.log('::notice::browser driver: codegpt extension'); return chromium; }
     } catch { /* try the next source */ }
   }
 
-  // 2. npm-installed patchright (CI). Require the downloaded browser so an
-  //    installed package without its binary degrades to a skip, not a crash.
+  // 2. npm-installed patchright (CI). Return the driver if it exposes launch();
+  //    the workflow installs the browser before this runs, and relying on
+  //    executablePath() existence proved unreliable across platforms.
   try {
     const chromium = chromiumOf(createRequire(import.meta.url)('patchright'));
-    if (chromium && existsSync(chromium.executablePath())) return chromium;
-  } catch { /* not installed */ }
+    if (chromium?.launch) { console.log('::notice::browser driver: npm patchright'); return chromium; }
+    console.log('::notice::browser driver: npm patchright loaded but no chromium.launch');
+  } catch (err) {
+    console.log('::notice::browser driver: npm patchright not loadable (' + err.message + ')');
+  }
 
+  console.log('::notice::browser driver: none (browser stages will skip)');
   return null;
 }
