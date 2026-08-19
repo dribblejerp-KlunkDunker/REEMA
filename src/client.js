@@ -1,4 +1,4 @@
-import { init, Session, Identity, signingPayload, decodeBundle, RECEIPT, isReceipt } from './crypto.js';
+import { init, Session, Identity, signingPayload, decodeBundle, loadPQ, RECEIPT, isReceipt } from './crypto.js';
 import { createTorSocket } from './tor.js';
 import { loadOrCreateIdentity, saveIdentity } from './identity.js';
 import { loadSessions, saveSessions } from './sessions.js';
@@ -32,6 +32,7 @@ const PORT = Number(process.env.RELAY_PORT || 7980);
 
 async function main() {
   const sodium = await init();
+  await loadPQ(); // keygen + bundle/OTK signing + session work all need ML-KEM/ML-DSA
   const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
   const unb64 = (s) => sodium.from_base64(s, sodium.base64_variants.ORIGINAL);
 

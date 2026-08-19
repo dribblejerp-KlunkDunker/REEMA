@@ -15,7 +15,14 @@ import path from 'node:path';
  */
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const SESSIONS_FILE = path.join(ROOT, '.sessions.json');
+const DEFAULT_SESSIONS_FILE = path.join(ROOT, '.sessions.json');
+
+// Env-overridable, mirroring src/identity.js: BLACKVAULT_SESSIONS_FILE (exact
+// path) > BLACKVAULT_STATE_DIR (dir containing .identity.json + .sessions.json)
+// > project root. A test spawns the CLI client with BLACKVAULT_STATE_DIR set to
+// a temp dir so identity + sessions never touch the shared checkout.
+const SESSIONS_FILE = process.env.BLACKVAULT_SESSIONS_FILE
+  || (process.env.BLACKVAULT_STATE_DIR ? path.join(process.env.BLACKVAULT_STATE_DIR, '.sessions.json') : DEFAULT_SESSIONS_FILE);
 
 /** Deterministic encryption key bound to this identity. */
 export function sessionStoreKey(sodium, identity) {

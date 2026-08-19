@@ -1,6 +1,6 @@
 import { createServer } from 'node:net';
 import { WebSocketServer } from 'ws';
-import { init, Identity } from './crypto.js';
+import { init, Identity, loadPQ } from './crypto.js';
 import { stripControls } from './sanitize.js';
 
 /**
@@ -372,8 +372,11 @@ const server = createServer((socket) => {
 });
 
 // Bind the crypto core before any client can publish (registration verifies
-// the bundle signature), then start the WebSocket listener.
+// the bundle signature), then start the WebSocket listener. The relay needs
+// ML-DSA verification the moment the first client registers, so it loads the
+// PQ graph at startup — unlike clients, whose init() defers it.
 sodium = await init();
+await loadPQ();
 
 const wss = new WebSocketServer({ host: HOST, port: WS_PORT, maxPayload: MAX_LINE_BYTES }, () => {
   console.log(`[server] WebSocket relay listening on ${HOST}:${WS_PORT}`);

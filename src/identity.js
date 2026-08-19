@@ -24,7 +24,14 @@ import path from 'node:path';
 // Do not wrap this in path.dirname() — that walks one level too far up and
 // drops the keyfile outside the project (it used to land on the Desktop).
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const KEYFILE = path.join(ROOT, '.identity.json');
+const DEFAULT_KEYFILE = path.join(ROOT, '.identity.json');
+
+// The keyfile path is env-overridable so a test (or a packaged deployment) can
+// isolate the CLI client's identity in a temp/state dir instead of the project
+// root. Precedence: BLACKVAULT_KEYFILE (exact path) > BLACKVAULT_STATE_DIR
+// (dir containing .identity.json + .sessions.json) > project root.
+const KEYFILE = process.env.BLACKVAULT_KEYFILE
+  || (process.env.BLACKVAULT_STATE_DIR ? path.join(process.env.BLACKVAULT_STATE_DIR, '.identity.json') : DEFAULT_KEYFILE);
 
 // Where the path bug used to write keys, so we can tell the user to clean up.
 const LEGACY_KEYFILE = path.join(path.dirname(ROOT), '.identity.json');

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { init, Identity, Session } from './crypto.js';
+import { init, Identity, Session, loadPQ } from './crypto.js';
 import { generateVaultIdentity, exportVault, importVault } from './vault.js';
 import { stripControls, shortKey } from './sanitize.js';
 
@@ -84,6 +84,7 @@ function withTimeout(label, p, ms = 30000) {
 
 async function main() {
   const sodium = await init();
+  await loadPQ(); // the whole suite does keygen + session work immediately
   const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
   const addr = (id) => b64(Identity.deriveAddress(id.signPk, id.pk));
   const otksOf = (id) => [...id.oneTimePrekeys.values()].map((kp) => ({
@@ -343,6 +344,96 @@ async function main() {
     assert('shortKey renders the spoofed senderDhPk control-free for the client console',
       !/[\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(shortKey(spoofRecv.envelope.senderDhPk))
       && shortKey(spoofRecv.envelope.senderDhPk).endsWith('...'));
+
+    // ---- REAL CLI client regression (VULN-006 end-to-end): spawn the actual
+    // src/client.js process against a TEMP identity/session dir (BLACKVAULT_
+    // STATE_DIR), deliver a control-laden senderDhPk envelope through the real
+    // relay, and assert the client's own stdout is escape-free. This closes the
+    // gap the earlier in-process check left: the unit assertion proved shortKey
+    // renders the payload control-free, but never exercised the real client's
+    // display path in a live process.
+    {
+      const { mkdtempSync, existsSync, statSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { fileURLToPath } = await import('node:url');
+      const tmpDir = mkdtempSync(join(tmpdir(), 'bv-client-e2e-'));
+      const projRoot = join(fileURLToPath(new URL('..', import.meta.url)), '.');
+      const projIdentity = join(projRoot, '.identity.json');
+      const projSessions = join(projRoot, '.sessions.json');
+      const projIdentityMtime = existsSync(projIdentity) ? statSync(projIdentity).mtimeMs : null;
+      const projSessionsMtime = existsSync(projSessions) ? statSync(projSessions).mtimeMs : null;
+
+      const clientProc = spawn(process.execPath, ['src/client.js', bobAddr, '--no-tor'], {
+        env: {
+          ...process.env,
+          RELAY_HOST: '127.0.0.1',
+          RELAY_PORT: String(RELAY_PORT),
+          BLACKVAULT_STATE_DIR: tmpDir,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let clientOut = '';
+      clientProc.stdout.on('data', (d) => { clientOut += d; });
+      clientProc.stderr.on('data', (d) => { clientOut += d; });
+
+      const tClient = Date.now();
+      while (!clientOut.includes('published + registered') && Date.now() - tClient < 45000) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert('real client registered against the temp identity', clientOut.includes('published + registered'));
+      const addrLine = clientOut.match(/my address\s*: (\S+)/);
+      assert('real client printed its (temp) address', !!addrLine);
+      const realClientAddr = addrLine[1];
+
+      // Env-override proof: the identity landed in the temp dir and the
+      // project-root identity file (if any) was not touched. (.sessions.json is
+      // written on persist — receive/close — so it is asserted after the
+      // graceful exit below.)
+      assert('identity persisted in BLACKVAULT_STATE_DIR', existsSync(join(tmpDir, '.identity.json')));
+      assert('project-root identity file untouched by the isolated client',
+        projIdentityMtime === null || statSync(projIdentity).mtimeMs === projIdentityMtime);
+
+      // The attack: a plausible first-contact envelope whose senderDhPk carries
+      // ESC + OSC-8 + Trojan-Source bidi. The relay forwards it (senderDhPk is
+      // validated only as a non-empty string); the real client's receive path
+      // hits the drop-and-display sink with shortKey().
+      const attackEnv = new Session(mallory, bob.makeBundle()).encrypt(Buffer.from('client sink probe', 'utf8'));
+      attackEnv.senderDhPk = '\x1b[2J' + '\x1b]8;;https://evil.example\x1b\\'
+        + '\u202e' + '\u2066' + '\u2067' + '\u2068' + '\u2069' + '\u061c' + '\u200e' + '\u200f'
+        + 'F'.repeat(36);
+      aliceClient.send({ type: 'send', toPk: realClientAddr, envelope: attackEnv, fromPk: aliceAddr });
+      const tHit = Date.now();
+      while (!clientOut.includes('dropped self-inconsistent envelope') && Date.now() - tHit < 15000) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert('real client hit the display sink for the crafted senderDhPk',
+        clientOut.includes('dropped self-inconsistent envelope'));
+
+      // The escape-free end-to-end assertion: the REAL process's stdout has no
+      // ESC, no other C0 controls (beyond the legitimate \n/\r/\t), and no
+      // bidi/format controls — across the whole session, not just the one line.
+      const dangerous = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u;
+      assert('real client stdout is escape-free end-to-end (no ESC/OSC)', !clientOut.includes('\x1b'));
+      assert('real client stdout has no C0 controls', !dangerous.test(clientOut));
+      assert('real client stdout resists Trojan-Source bidi/format controls', !/[\p{Cf}]/u.test(clientOut));
+
+      // Graceful exit: the client's close handler persists sessions, which
+      // writes .sessions.json into the temp dir — the second half of the
+      // env-override proof (the attack envelope was dropped pre-persist).
+      clientProc.stdin.write('exit\n');
+      const tExit = Date.now();
+      while (!existsSync(join(tmpDir, '.sessions.json')) && Date.now() - tExit < 10000) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert('sessions persisted in BLACKVAULT_STATE_DIR on exit',
+        existsSync(join(tmpDir, '.sessions.json')));
+      assert('project-root sessions file untouched by the isolated client',
+        projSessionsMtime === null || statSync(projSessions).mtimeMs === projSessionsMtime);
+
+      clientProc.kill();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
 
     console.log('\n=== Results ===');
     assert('relay never saw plaintext', !relayOut.includes(secret) && !relayErr.includes(secret)
