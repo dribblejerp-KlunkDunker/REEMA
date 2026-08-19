@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { init, Identity, Session } from './crypto.js';
+import { stripControls } from './sanitize.js';
 
 /**
  * Integration test: full E2EE messaging through the REAL relay (protocol v6).
@@ -14,6 +15,10 @@ import { init, Identity, Session } from './crypto.js';
  *   - messages round-trip in both directions across a ratchet step
  *   - a third party cannot decrypt a relayed envelope
  *   - queued (offline) delivery works by derived routing address
+ *   - the relay sanitizes control characters in logged keys/addresses, so a
+ *     crafted toPk cannot inject terminal escape sequences into its console
+ *   - the shared stripControls() strips control bytes from peer message
+ *     plaintext in the CLI client, so decrypted text cannot inject escapes
  */
 
 const RELAY_PORT = Number(process.env.TEST_RELAY_PORT || 7999);
@@ -85,6 +90,59 @@ async function main() {
   }));
 
   console.log('=== Integration Test: E2EE messaging through relay (protocol v6) ===\n');
+
+  // ---- Terminal sanitization (VULN-005/006): stripControls() must remove
+  // every C0/DEL/C1 byte so attacker-controlled plaintext (or a crafted toPk)
+  // cannot fire ANSI/OSC terminal escape sequences. Deterministic unit
+  // regression; the relay sink is additionally covered end-to-end below.
+  {
+    console.log('=== Terminal sanitization (VULN-005/006) ===');
+    const malicious =
+      '\x1b[2J' +                             // ANSI clear-screen
+      '\x1b]8;;https://evil.example\x1b\\' +   // OSC-8 hyperlink
+      '\x1b]0;pwned\x07' +                     // OSC title + BEL
+      'Hello\x1b[31m' + 'red' + '\x1b[0m' + ' world' + '\x7f';
+    const clean = stripControls(malicious);
+    assert('strips every C0/C1/DEL control byte', !/[\u0000-\u001f\u007f-\u009f]/.test(clean));
+    assert('removes the ESC introducer so no ANSI/OSC sequence can fire', !clean.includes('\x1b'));
+    assert('keeps printable payload text intact', clean.includes('Hello') && clean.includes('red') && clean.includes('world'));
+    assert('passes clean text through unchanged', stripControls('plain text') === 'plain text');
+    assert('leaves non-strings alone', stripControls(undefined) === undefined && stripControls(123) === 123);
+    // The relay echoes `unknown type: ${msg.type}` back over the wire and the
+    // client prints msg.error raw, so the echo must also be control-free.
+    assert('sanitizes the relay unknown-type echo shape',
+      !/[\u0000-\u001f\u007f-\u009f]/.test(stripControls(`unknown type: ${malicious}`)));
+    console.log(`[test] sanitized: ${JSON.stringify(clean)}`);
+  }
+
+  // ---- Trojan-Source bidi/format controls: stripControls() must also remove
+  // Unicode format characters (\p{Cf}) — bidi overrides/isolates and
+  // directional marks — so a crafted string cannot reorder or hide the text
+  // the operator actually sees (a log line that renders backwards, or a URL
+  // whose visible text points elsewhere than its real target).
+  {
+    console.log('=== Trojan-Source bidi/format sanitization ===');
+    const bidiControls =
+      '\u202a\u202b\u202c\u202d\u202e' +      // LRE/RLE/PDF/LRO/RLO
+      '\u2066\u2067\u2068\u2069' +            // LRI/RLI/FSI/PDI isolates
+      '\u061c' +                               // Arabic letter mark
+      '\u200e\u200f' +                         // LRM/RLM directional marks
+      '\u200b\u200c\u200d\ufeff' +           // ZWSP/ZWNJ/ZWJ/ZWNBSP
+      '\u2060\u00ad';                          // word joiner, soft hyphen
+    // Classic Trojan-Source shape: the log line's bytes read "file is safe",
+    // but with an RLO the trailing text renders FIRST and in reverse.
+    const spoofed = `file \u202e is safe \u2066 \u202e rm -rf / \u2069`;
+    const clean = stripControls(spoofed);
+    assert('strips every Unicode format control (\p{Cf})', !/[\p{Cf}]/u.test(clean));
+    assert('strips the RLO override (U+202E)', !clean.includes('\u202e'));
+    assert('strips the bidi isolates (U+2066-2069)', !/[\u2066-\u2069]/.test(clean));
+    assert('strips every bidi/format control byte from the payload', ![...bidiControls].some((c) => clean.includes(c)));
+    assert('keeps the surrounding printable text', clean.includes('file') && clean.includes('safe') && clean.includes('rm -rf /'));
+    assert('passes clean text through unchanged', stripControls('plain text') === 'plain text');
+    assert('leaves non-strings alone', stripControls(null) === null && stripControls(42) === 42);
+    console.log(`[test] bidi-sanitized: ${JSON.stringify(clean)}`);
+  }
+
 
   // Spawn the real relay; capture its output so we can prove it never leaks
   // plaintext (it only logs addresses and ciphertext-forwarding events).
@@ -202,9 +260,25 @@ async function main() {
     const carolPlain = new Session(carol, alice.makeBundle()).decrypt(carolMsg.envelope);
     console.log(`[test] Carol received queued message: "${carolPlain}"`);
 
+    // ---- Log-injection regression (VULN-005): a crafted `toPk` must not emit
+    // terminal escape sequences into the relay's operator console. The send
+    // path treats `toPk` as an opaque routing key (any non-empty string), so a
+    // hostile client could otherwise clear the screen or plant OSC-8 hyperlinks
+    // in the log. Send a plausible envelope with a control-laden toPk and
+    // assert the relay's own output stays clean — ANSI/OSC escapes AND
+    // Trojan-Source bidi/format controls (RLO, isolates, directional marks).
+    const injectedPk = '\x1b[2J' + '\x1b]8;;https://evil.example\x1b\\'
+      + '\u202e' + '\u2066' + '\u2067' + '\u2068' + '\u2069' + '\u061c' + '\u200e' + '\u200f'
+      + 'Z'.repeat(44);
+    aliceClient.send({ type: 'send', toPk: injectedPk, envelope: aliceSession.encrypt(Buffer.from('log injection probe', 'utf8')), fromPk: aliceAddr });
+    await new Promise((r) => setTimeout(r, 100));
+
     console.log('\n=== Results ===');
     assert('relay never saw plaintext', !relayOut.includes(secret) && !relayErr.includes(secret)
       && !relayOut.includes(reply) && !relayErr.includes(reply));
+    assert('relay log sanitizes toPk (no ESC/OSC terminal escape sequences)', !relayOut.includes('\x1b'));
+    assert('relay log resists Trojan-Source bidi/format spoofing (no \p{Cf} in relay output)',
+      !/[\p{Cf}]/u.test(relayOut) && !/[\p{Cf}]/u.test(relayErr));
     assert('Bob decrypted Alice message correctly', decrypted === secret);
     assert('Alice decrypted Bob reply correctly', decryptedReply === reply);
     assert('Mallory cannot decrypt relayed message', malloryBlocked);

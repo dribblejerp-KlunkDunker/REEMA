@@ -1,6 +1,7 @@
 import { createServer } from 'node:net';
 import { WebSocketServer } from 'ws';
 import { init, Identity } from './crypto.js';
+import { stripControls } from './sanitize.js';
 
 /**
  * Ciphertext-only relay + key directory (protocol v6).
@@ -54,7 +55,17 @@ const online = new Map();
 const directory = new Map();
 let sodium = null; // bound by init() before the servers listen
 
-const short = (pk) => (typeof pk === 'string' ? pk.slice(0, 16) + '...' : '<invalid>');
+// Sanitize control characters before echoing a key/address into the operator's
+// console. The `send` path accepts an arbitrary non-empty string as `toPk`
+// (the relay treats it as an opaque routing key), so a crafted value could
+// otherwise inject ANSI/OSC terminal escape sequences into the log (VULN-005)
+// or reorder/hide text via Unicode bidi/format controls (Trojan-Source).
+// stripControls() strips both; the slice keeps the log line short.
+const short = (pk) => {
+  if (typeof pk !== 'string') return '<invalid>';
+  return stripControls(pk).slice(0, 16) + '...';
+};
+
 
 function isAlive(client) {
   if (!client) return false;
@@ -293,7 +304,7 @@ function handleLine(client, line) {
       break;
 
     default:
-      sendLine(client, { type: 'error', error: `unknown type: ${msg.type}` });
+      sendLine(client, { type: 'error', error: `unknown type: ${stripControls(msg.type)}` });
   }
 }
 

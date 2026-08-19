@@ -3,6 +3,7 @@ import { createTorSocket } from './tor.js';
 import { loadOrCreateIdentity, saveIdentity } from './identity.js';
 import { loadSessions, saveSessions } from './sessions.js';
 import { createInterface } from 'node:readline';
+import { stripControls } from './sanitize.js';
 
 /**
  * E2EE messaging client (protocol v6).
@@ -308,7 +309,7 @@ async function main() {
             console.log(`[client] receipt from ${senderPkB64.slice(0, 16)}... (session established)`);
           } else {
             console.log(`\n[client] <<< from ${senderPkB64.slice(0, 16)}...`);
-            console.log(`[client] <<< ${plaintext}`);
+            console.log(`[client] <<< ${stripControls(plaintext)}`);
           }
           persist();
         } catch (err) {
@@ -324,7 +325,7 @@ async function main() {
         break;
 
       case 'error':
-        console.error('[client] server error:', msg.error);
+        console.error('[client] server error:', stripControls(msg.error));
         break;
     }
   }
