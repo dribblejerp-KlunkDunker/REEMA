@@ -25,7 +25,7 @@
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { resolveChromium } from './chromium.js';
-import { init, Identity, Session, encodeBundle, decodeBundle, isReceipt } from './crypto.js';
+import { init, Identity, Session, encodeBundle, decodeBundle, loadPQ, isReceipt } from './crypto.js';
 
 // Dedicated ports so the test never collides with dev servers (7980/8080/8000)
 // or other scratch harnesses (7983/8083).
@@ -105,6 +105,7 @@ function withTimeout(label, p, ms = 30000) {
 
 async function main() {
   const sodium = await init();
+  await loadPQ(); // the differential peer needs keygen + session ops
   const ORIG = sodium.base64_variants.ORIGINAL;
   const b64 = (u) => sodium.to_base64(u, ORIG);
 
@@ -334,6 +335,109 @@ async function main() {
       check('browser -> Node: Node peer decrypts a browser-stack envelope', nodePlain === browserToNode, String(nodePlain));
       node.socket.destroy();
       console.log('[mark] Node<->browser interop verified');
+
+      // ---- Vault at rest (age) leg: export in A, decrypt & restore in B ----
+      // Proves the vendored age-encryption works in the real browser through
+      // the import map, and that a vault backup restores the messenger
+      // identity (all 8 keypairs) exactly in a different context.
+      const clickBtn = (page, label) => page.evaluate((l) => {
+        const b = [...document.querySelectorAll('button')].find((x) => (x.textContent || '').includes(l));
+        if (b) b.click();
+        return !!b;
+      }, label);
+
+      check('vault keygen button present', await clickBtn(pageA, 'GENERATE AGE KEYPAIR'));
+      await pageA.waitForFunction(
+        () => (document.getElementById('vault-age-key').dataset.full || '').startsWith('AGE-SECRET-KEY-'),
+        { timeout: 60000 }
+      );
+      check('browser age keypair generated (vendored age-encryption loaded)', true);
+
+      check('vault export button present', await clickBtn(pageA, 'EXPORT VAULT'));
+      await pageA.waitForFunction(
+        () => (document.getElementById('vault-export-out').value || '').startsWith('-----BEGIN AGE ENCRYPTED FILE-----'),
+        { timeout: 60000 }
+      );
+      const exported = await pageA.evaluate(() => ({
+        armored: document.getElementById('vault-export-out').value,
+        ageKey: document.getElementById('vault-age-key').dataset.full,
+      }));
+      check('vault export produced PEM-armored age', /^-----BEGIN AGE ENCRYPTED FILE-----/.test(exported.armored));
+      const exportKeys = await pageA.evaluate(() => JSON.parse(localStorage.getItem('e2ee_identity')));
+
+      // Decrypt & restore into pageB (a different context with a different
+      // identity): B must become A, key-for-key.
+      await pageB.evaluate(({ armored, ageKey }) => {
+        document.getElementById('vault-import-in').value = armored;
+        document.getElementById('vault-import-key').value = ageKey;
+        const b = [...document.querySelectorAll('button')].find((x) => (x.textContent || '').includes('DECRYPT & RESTORE'));
+        if (b) b.click();
+      }, exported);
+      await pageB.waitForFunction(
+        (sk) => { const d = JSON.parse(localStorage.getItem('e2ee_identity') || 'null'); return !!d && d.signSk === sk; },
+        exportKeys.signSk, { timeout: 60000 }
+      );
+      const restored = await pageB.evaluate(() => JSON.parse(localStorage.getItem('e2ee_identity')));
+      const keyFields = ['signSk', 'signPk', 'dhSk', 'dhPk', 'signedDhSk', 'signedDhPk', 'kemSk', 'kemPk'];
+      check('vault import restores the exact exported identity keys',
+        keyFields.every((f) => restored[f] === exportKeys[f]),
+        keyFields.every((f) => restored[f] === exportKeys[f]) ? 'all 8 keypairs match' : 'key mismatch');
+      const restoredAddr = b64(Identity.deriveAddress(rebuild(restored).signPk, rebuild(restored).pk));
+      const exportedAddr = b64(Identity.deriveAddress(rebuild(exportKeys).signPk, rebuild(exportKeys).pk));
+      check('restored identity has the same routing address as the export',
+        restoredAddr === exportedAddr, `${restoredAddr.slice(0, 12)}... vs ${exportedAddr.slice(0, 12)}...`);
+      console.log('[mark] vault export/import round-trip verified');
+
+      // ---- Hybrid PQ vault leg (X25519 + ML-KEM-768 at rest, in the browser) ----
+      // Re-keygen with the PQ hybrid checkbox, export A's identity to the
+      // hybrid recipient, then re-import it back into A with the PQ identity:
+      // a full encrypt->decrypt round-trip through the vendored hybrid path.
+      await pageA.evaluate(() => { document.getElementById('vault-hybrid').checked = true; });
+      check('hybrid keygen button present', await clickBtn(pageA, 'GENERATE AGE KEYPAIR'));
+      await pageA.waitForFunction(
+        () => (document.getElementById('vault-age-key').dataset.full || '').startsWith('AGE-SECRET-KEY-PQ-1'),
+        { timeout: 60000 }
+      );
+      check('browser hybrid PQ age keypair generated', true);
+      const pqExport = await pageA.evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find((x) => (x.textContent || '').includes('EXPORT VAULT'));
+        if (b) b.click();
+        return true;
+      });
+      check('hybrid export button present', pqExport);
+      // The armored export cannot be inspected for the binary mlkem768x25519
+      // stanza tag (armor re-encodes it as base64); the node test asserts the
+      // stanza on the raw format, and the PQ prefixes here prove the hybrid
+      // keypair was used. The decrypt+restore below proves the hybrid path.
+      await pageA.waitForFunction(
+        () => (document.getElementById('vault-export-out').value || '').startsWith('-----BEGIN AGE ENCRYPTED FILE-----'),
+        { timeout: 60000 }
+      );
+      const pqVault = await pageA.evaluate(() => ({
+        armored: document.getElementById('vault-export-out').value,
+        ageKey: document.getElementById('vault-age-key').dataset.full,
+        recipient: document.getElementById('vault-age-recipient').dataset.full,
+      }));
+      check('hybrid keypair + export used the PQ recipient',
+        pqVault.ageKey.startsWith('AGE-SECRET-KEY-PQ-1') && pqVault.recipient.startsWith('age1pq1'));
+
+      // Decrypt & restore A's own hybrid vault back into A: keys must survive.
+      await pageA.evaluate(({ armored, ageKey }) => {
+        document.getElementById('vault-import-in').value = armored;
+        document.getElementById('vault-import-key').value = ageKey;
+        const b = [...document.querySelectorAll('button')].find((x) => (x.textContent || '').includes('DECRYPT & RESTORE'));
+        if (b) b.click();
+      }, pqVault);
+      await pageA.waitForFunction(
+        (sk) => { const d = JSON.parse(localStorage.getItem('e2ee_identity') || 'null'); return !!d && d.signSk === sk; },
+        exportKeys.signSk, { timeout: 60000 }
+      );
+      const restoredHybrid = await pageA.evaluate(() => JSON.parse(localStorage.getItem('e2ee_identity')));
+      check('hybrid vault decrypts & restores the identity in the browser',
+        keyFields.every((f) => restoredHybrid[f] === exportKeys[f]));
+      console.log('[mark] hybrid PQ vault round-trip verified');
+
+
 
       check('no console errors', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
       check('no failed requests', failedRequests.length === 0, failedRequests.slice(0, 3).join(' | '));

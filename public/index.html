@@ -1522,6 +1522,44 @@ footer p{font-family:'Cinzel',serif;font-size:10px;letter-spacing:.3em;color:var
         </div>
       </div>
 
+      <!-- Vault at Rest Panel (age format) -->
+      <div class="panel-card" style="margin-top:14px">
+        <div class="pcard-label">Vault at Rest <span style="font-family:'Cinzel',serif;font-size:8px;color:var(--green);letter-spacing:.1em">AGE FORMAT — DECRYPTS WITH THE STANDARD age/rage CLIs</span></div>
+        <div style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:13px;color:var(--text-dim);margin-bottom:10px">
+          Back up your E2EE identity as a standard <strong>age</strong> vault (age-encryption.org/v1) — the official <code>age</code>/<code>rage</code> CLIs can decrypt it, so a backup is never locked into this app. Keys and passphrases stay in your browser.
+        </div>
+        <div style="display:flex;gap:14px;flex-wrap:wrap">
+          <div style="flex:1;min-width:280px">
+            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:6px">1 · GENERATE AGE KEYPAIR (MEMORY ONLY)</div>
+            <button type="button" class="cs-btn" onclick="vaultKeygen()">🔑 GENERATE AGE KEYPAIR</button>
+            <label style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:12px;color:var(--text-dim);margin-left:8px;cursor:pointer">
+              <input type="checkbox" id="vault-hybrid" style="accent-color:var(--green);vertical-align:middle"> PQ hybrid (X25519 + ML-KEM-768)
+            </label>
+            <div class="did-key-box" id="vault-age-key" style="cursor:pointer;font-size:10px;margin-top:8px" title="Click to copy" onclick="navigator.clipboard.writeText(this.dataset.full || this.innerText); showToast('Age Secret Key Copied')">—</div>
+            <div class="did-key-box" id="vault-age-recipient" style="cursor:pointer;font-size:10px;margin-top:6px" title="Click to copy" onclick="navigator.clipboard.writeText(this.dataset.full || this.innerText); showToast('Age Recipient Copied')">—</div>
+          </div>
+          <div style="flex:1;min-width:280px">
+            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:6px">2 · ENCRYPT IDENTITY BACKUP</div>
+            <input type="password" id="vault-passphrase" class="osint-input" placeholder="Optional passphrase (scrypt) — or rely on the keypair" style="width:100%;margin-bottom:6px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button type="button" class="cs-btn" onclick="vaultExport()">🔐 EXPORT VAULT</button>
+              <button type="button" class="fi-btn" style="border-color:var(--bronze-mid);color:var(--bronze-sheen)" onclick="vaultCopy()">📋 COPY</button>
+              <button type="button" class="fi-btn" style="border-color:var(--bronze-mid);color:var(--bronze-sheen)" onclick="vaultDownload()">⬇ DOWNLOAD .age</button>
+            </div>
+            <textarea id="vault-export-out" class="osint-input" readonly style="width:100%;height:110px;margin-top:8px;font-family:monospace;font-size:10px;resize:vertical" placeholder="Armored vault will appear here..."></textarea>
+          </div>
+          <div style="flex:1;min-width:280px">
+            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:6px">3 · DECRYPT &amp; RESTORE IDENTITY</div>
+            <textarea id="vault-import-in" class="osint-input" style="width:100%;height:64px;font-family:monospace;font-size:10px;resize:vertical" placeholder="Paste an armored age vault..."></textarea>
+            <input type="password" id="vault-import-key" class="osint-input" placeholder="AGE-SECRET-KEY-1... (or use a passphrase below)" style="width:100%;margin-top:6px;font-size:10px">
+            <input type="password" id="vault-import-passphrase" class="osint-input" placeholder="...or the vault passphrase" style="width:100%;margin-top:6px">
+            <button type="button" class="analyze-btn" style="margin-top:8px" onclick="vaultImport()">♻️ DECRYPT &amp; RESTORE IDENTITY</button>
+          </div>
+        </div>
+      </div>
+
+
+
       <!-- Session Tabs -->
       <div id="session-tabs-bar" style="display:flex;gap:6px;margin-top:14px;flex-wrap:wrap;align-items:center">
         <span style="font-family:'Cinzel',serif;font-size:9px;color:var(--text-dim);letter-spacing:.15em">SESSIONS:</span>
@@ -3300,12 +3338,15 @@ function exportJSONLD() {
   "imports": {
     "@noble/post-quantum/": "./vendor/@noble/post-quantum/",
     "@noble/hashes/": "./vendor/@noble/hashes/",
-    "@noble/curves/": "./vendor/@noble/curves/"
+    "@noble/curves/": "./vendor/@noble/curves/",
+    "@noble/ciphers/": "./vendor/@noble/ciphers/",
+    "@scure/base": "./vendor/@scure/base/index.js",
+    "age-encryption": "./vendor/age-encryption/dist/index.js"
   }
 }
 </script>
 <script type="module">
-  import { init, Identity, Session, signingPayload, encodeBundle, decodeBundle, RECEIPT, isReceipt } from './browser-crypto.js';
+  import { init, Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, RECEIPT, isReceipt } from './browser-crypto.js';
 
   let myId;
   let sodium;
@@ -3323,26 +3364,65 @@ function exportJSONLD() {
   // ---- Identity management ----
 
   // ---- v6 identity persistence (keys + one-time prekey pool) ----
-  function persistIdentity() {
+  // The v6 identity JSON shape (private keys + one-time prekey pool) that is
+  // persisted to localStorage — and what a vault backup contains. A vault
+  // restores the messenger identity exactly, OTK pool included.
+  function identityToJSON() {
     const b = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
     const otks = {};
     for (const [otkId, kp] of myId.oneTimePrekeys) {
       otks[otkId] = { dhSk: b(kp.sk), dhPk: b(kp.pk), signature: b(kp.signature) };
     }
-    localStorage.setItem('e2ee_identity', JSON.stringify({
+    return {
       v: 6,
       signSk: b(myId.signSk), signPk: b(myId.signPk),
       dhSk: b(myId.sk), dhPk: b(myId.pk),
       signedDhSk: b(myId.signedDhSk), signedDhPk: b(myId.signedDhPk),
       kemSk: b(myId.kemSk), kemPk: b(myId.kemPk),
       oneTimePrekeys: otks,
-    }));
+    };
   }
+
+  function persistIdentity() {
+    localStorage.setItem('e2ee_identity', JSON.stringify(identityToJSON()));
+  }
+
+  // Rebuild myId/myPk/myAddress from a v6 identity object (the shape
+  // identityToJSON writes). Shared by startup restore and vault import; the
+  // caller persists and clears sessions as appropriate. Restoring a persisted
+  // identity needs no PQ (keys are supplied); the ML-KEM/ML-DSA graph is
+  // fetched only if the one-time-prekey pool must be topped up.
+  async function restoreIdentityFromData(data) {
+    const unb64 = (s) => sodium.from_base64(s, sodium.base64_variants.ORIGINAL);
+    myId = new Identity({
+      signSk: unb64(data.signSk), signPk: unb64(data.signPk),
+      sk: unb64(data.dhSk), pk: unb64(data.dhPk),
+      signedDhSk: unb64(data.signedDhSk), signedDhPk: unb64(data.signedDhPk),
+      kemSk: unb64(data.kemSk), kemPk: unb64(data.kemPk),
+    });
+    const otks = new Map();
+    for (const [otkId, kp] of Object.entries(data.oneTimePrekeys || {})) {
+      otks.set(Number(otkId), {
+        id: Number(otkId), sk: unb64(kp.dhSk), pk: unb64(kp.dhPk), signature: unb64(kp.signature),
+      });
+    }
+    myId.oneTimePrekeys = otks;
+    if (myId.oneTimePrekeys.size < OTK_POOL_SIZE) {
+      await loadPQ(); // OTK top-up signs each prekey with ML-DSA-65
+      myId.newOneTimePrekeys(OTK_POOL_SIZE);
+      persistIdentity();
+    }
+    myPk = sodium.to_base64(myId.pk, sodium.base64_variants.ORIGINAL);
+    myAddress = sodium.to_base64(Identity.deriveAddress(myId.signPk, myId.pk), sodium.base64_variants.ORIGINAL);
+    updateUIWithKeys();
+  }
+
 
   // Authenticated registration: publish the identity-bound address, the
   // self-signed bundle (proof-of-possession) and the one-time prekey pool.
-  function publishToRelay() {
+  async function publishToRelay() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    await loadPQ(); // makeBundle self-signs the bundle with ML-DSA-65
     const b = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
     const otks = [...myId.oneTimePrekeys.values()].map((kp) => ({
       id: kp.id, dhPk: b(kp.pk), signature: b(kp.signature),
@@ -3363,6 +3443,7 @@ function exportJSONLD() {
   }
 
   window.generateNewE2EEIdentity = async function() {
+    await loadPQ(); // fresh keygen needs ML-DSA-65 + ML-KEM-768
     myId = new Identity();
     myId.newOneTimePrekeys(OTK_POOL_SIZE);
     persistIdentity();
@@ -3376,7 +3457,7 @@ function exportJSONLD() {
     renderAllSessionTabs();
     document.getElementById('chat-feed').innerHTML = '<div id="chat-empty" style="text-align:center;font-family:\'Cormorant Garamond\',serif;font-style:italic;color:var(--text-dim);margin-top:40px;">Session reset. New identity active.</div>';
     document.getElementById('session-info-bar').style.display = 'none';
-    publishToRelay();
+    await publishToRelay();
     showToast('Identity Rotated — New v6 keypairs (ML-DSA-65 + X25519 + ML-KEM-768 + OTK pool)');
   };
 
@@ -3404,6 +3485,125 @@ function exportJSONLD() {
     });
   };
 
+  // ---- Vault at rest (age format) ----
+  // The vault core is lazy-imported so age-encryption and its @noble deps are
+  // only fetched/parsed when the vault UI is first used — same deferral
+  // posture as the PQ lazy-load and the deferred E2EE bootstrap. Keys and
+  // passphrases stay in memory / the page; nothing vault-related leaves the
+  // browser except the armored ciphertext the user copies or downloads.
+  let vaultModPromise = null;
+  function vaultCore() {
+    if (!vaultModPromise) vaultModPromise = import('./vault-core.js');
+    return vaultModPromise;
+  }
+  let vaultIdentity = null; // age keypair, held in memory for this session only
+
+  window.vaultKeygen = async function() {
+    try {
+      const hybrid = document.getElementById('vault-hybrid').checked;
+      const { generateVaultIdentity } = await vaultCore();
+      vaultIdentity = await generateVaultIdentity({ hybrid });
+      const idEl = document.getElementById('vault-age-key');
+      idEl.dataset.full = vaultIdentity.identity;
+      idEl.innerText = vaultIdentity.identity.slice(0, 26) + '...' + vaultIdentity.identity.slice(-6);
+      const recEl = document.getElementById('vault-age-recipient');
+      recEl.dataset.full = vaultIdentity.recipient;
+      recEl.innerText = vaultIdentity.recipient;
+      showToast(hybrid ? '🔑 Hybrid PQ age keypair generated (X25519 + ML-KEM-768, memory only)'
+                       : '🔑 Age keypair generated (memory only for this session)');
+    } catch (err) {
+      console.error('[vault] keygen failed:', err);
+      showToast('⚠️ Age keygen failed — ' + err.message);
+    }
+  };
+
+  window.vaultExport = async function() {
+    const passphrase = document.getElementById('vault-passphrase').value;
+    if (!vaultIdentity && !passphrase) {
+      showToast('Generate an age keypair or set a passphrase first');
+      return;
+    }
+    try {
+      const { exportVault } = await vaultCore();
+      // The vault payload is the SAME v6 identity JSON that persistIdentity
+      // writes to localStorage — so a vault restores the messenger identity
+      // exactly, one-time prekey pool included.
+      const armored = await exportVault(JSON.stringify(identityToJSON()), {
+        recipient: vaultIdentity ? vaultIdentity.recipient : undefined,
+        passphrase: passphrase || undefined,
+      });
+      document.getElementById('vault-export-out').value = armored;
+      showToast('🔐 Identity encrypted to an age vault (' + armored.length + ' chars)');
+    } catch (err) {
+      console.error('[vault] export failed:', err);
+      showToast('⚠️ Export failed — ' + err.message);
+    }
+  };
+
+  window.vaultCopy = function() {
+    const armored = document.getElementById('vault-export-out').value;
+    if (!armored) { showToast('Export a vault first'); return; }
+    navigator.clipboard.writeText(armored);
+    showToast('📋 Armored vault copied to clipboard');
+  };
+
+  window.vaultDownload = function() {
+    const armored = document.getElementById('vault-export-out').value;
+    if (!armored) { showToast('Export a vault first'); return; }
+    const blob = new Blob([armored], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'blackvault-identity.age';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    showToast('⬇ Vault downloaded as blackvault-identity.age');
+  };
+
+  window.vaultImport = async function() {
+    const armored = document.getElementById('vault-import-in').value.trim();
+    if (!armored) { showToast('Paste an armored age vault first'); return; }
+    const key = document.getElementById('vault-import-key').value.trim();
+    const passphrase = document.getElementById('vault-import-passphrase').value;
+    if (!key && !passphrase) { showToast('Provide the AGE-SECRET-KEY or passphrase'); return; }
+    let plain;
+    try {
+      const { importVault } = await vaultCore();
+      plain = await importVault(armored, {
+        identities: key ? [key] : [],
+        passphrase: passphrase || undefined,
+        asText: true,
+      });
+    } catch (err) {
+      showToast('⚠️ Decrypt failed — ' + err.message);
+      return;
+    }
+    let data;
+    try { data = JSON.parse(plain); } catch { showToast('⚠️ Vault is not a BlackVault identity backup'); return; }
+    const needs = ['signSk', 'signPk', 'dhSk', 'dhPk', 'signedDhSk', 'signedDhPk', 'kemSk', 'kemPk'];
+    if (!(data && data.v === 6 && needs.every((f) => typeof data[f] === 'string'))) {
+      showToast('⚠️ Vault is not a BlackVault v6 identity backup');
+      return;
+    }
+    try {
+      await restoreIdentityFromData(data);
+      persistIdentity();
+      sessions.clear();
+      localStorage.removeItem('e2ee_sessions');
+      localStorage.removeItem('e2ee_active_peer');
+      activePeerPk = null;
+      renderAllSessionTabs();
+      document.getElementById('chat-feed').innerHTML = '<div id="chat-empty" style="text-align:center;font-family:\'Cormorant Garamond\',serif;font-style:italic;color:var(--text-dim);margin-top:40px;">Identity restored from vault. New identity active.</div>';
+      document.getElementById('session-info-bar').style.display = 'none';
+      await publishToRelay();
+      showToast('♻️ Identity restored from vault — re-published to the relay');
+    } catch (err) {
+      console.error('[vault] restore failed:', err);
+      showToast('⚠️ Restore failed — ' + err.message);
+    }
+  };
+
+
+
   // ---- Session management ----
 
   /**
@@ -3425,9 +3625,10 @@ function exportJSONLD() {
     }
   }
 
-  window.openSession = function() {
+  window.openSession = async function() {
     const raw = document.getElementById('peer-key-input').value.trim();
     if (!raw) { showToast('Enter a peer prekey bundle or address first'); return; }
+    await loadPQ(); // canonicalPeerBundle verifies the bundle's ML-DSA-65 signature
 
     // Address mode: the session is established on first send (directory fetch).
     if (raw.length === 44) {
@@ -3741,10 +3942,11 @@ function exportJSONLD() {
     ws = new WebSocket(relayUrl);
     const statusSpan = document.getElementById('relay-status');
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
       statusSpan.innerHTML = '🟢 RELAY CONNECTED';
       statusSpan.style.color = 'var(--green)';
-      publishToRelay();
+      try { await publishToRelay(); }
+      catch (err) { console.error('[E2EE] registration failed:', err); }
     };
 
     ws.onclose = () => {
@@ -3856,6 +4058,7 @@ function exportJSONLD() {
       const raw = document.getElementById('peer-key-input').value.trim();
       const text = document.getElementById('chat-input').value.trim();
       if (!raw || !text) { showToast('Enter a peer bundle or address and a message.'); return; }
+      await loadPQ(); // session establish/encrypt needs ML-KEM-768
 
       let peer;
       let peerOtk = null;
