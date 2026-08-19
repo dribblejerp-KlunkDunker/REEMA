@@ -126,6 +126,7 @@ never transmitted, binding each envelope to one conversation.
 │   └── index.js       # keygen / bundle / pubkey / info / vault-*
 ├── public/
 │   ├── crypto-core.js # shared Identity, Session (Double Ratchet), signingPayload
+│   ├── group-core.js  # GroupSession prototype — MLS-style groups over group_id routing
 │   ├── vault-core.js  # shared vault-at-rest core (age format) — Node + browser
 │   ├── browser-crypto.js   # thin browser adapter over crypto-core.js
 │   ├── index.html     # dashboard UI with an E2EE Network tab + age vault panel
@@ -150,7 +151,9 @@ Two-party demo and security assertions:
 npm run demo
 ```
 
-Integration test through the relay, plus the mutation fuzzer, a headless
+Integration test through the relay (incl. a malformed-envelope crash
+regression — crafted packet types must reject, not kill the process), plus the
+mutation fuzzer, a headless
 two-context browser E2E, a headless XSS regression for the Gemini render path,
 a headless messenger smoke test (an A→B→A flow through `public/messenger.html`),
 and a doc-consistency check that keeps the README/ROADMAP bundle-size figures
