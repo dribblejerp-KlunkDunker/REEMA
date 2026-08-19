@@ -21,15 +21,63 @@
  *     message; two peers who both send their first message before receiving
  *     still converge (each receives the other's first chain directly).
  *
- * This module is environment-agnostic: it imports only @noble/post-quantum and
- * talks to libsodium through the instance injected by useSodium(). Both the
- * Node CLI (src/crypto.js) and the browser client (public/browser-crypto.js)
- * are thin adapters over this one core.
+ * This module is environment-agnostic: it talks to libsodium through the
+ * instance injected by useSodium(), and it lazily imports the ML-KEM-768 /
+ * ML-DSA-65 implementations (loadPQ) only when crypto is first needed, so the
+ * @noble/post-quantum graph (~67 KB brotli, incl. @noble/hashes + @noble/curves)
+ * stays out of the page's initial module graph. Both the Node CLI (src/crypto.js)
+ * and the browser client (public/browser-crypto.js) are thin adapters over this
+ * one core. init() binds sodium only; loadPQ() is deferred to the first
+ * operation that actually needs ML-KEM/ML-DSA (identity keygen, bundle/OTK
+ * signing, bundle verification, or a session encrypt/decrypt), so a client
+ * that restores a persisted identity and sessions never parses the PQ graph
+ * until a session is first established. Every PQ-touching method guards with
+ * requirePQ(), so forgetting to await loadPQ() fails loudly instead of
+ * dereferencing null.
  */
-import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
-import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
-
 let sodium = null;
+let ml_kem768 = null; // bound by loadPQ() — see the init() contract below
+let ml_dsa65 = null;
+let pqPromise = null;
+
+/**
+ * Dynamically import the ML-KEM-768 / ML-DSA-65 implementations on first use
+ * (idempotent — later calls reuse the same promise). They are the only reason
+ * @noble/post-quantum and its @noble/hashes/@noble/curves dependencies are in
+ * the module graph, so deferring them keeps them out of the initial page load:
+ * they are fetched when identity keygen runs (fresh identity), when a bundle
+ * or one-time prekey is signed/verified, or when a session is first
+ * established — never at init(). Adapters re-export this; consumers await it
+ * before the first operation that touches ML-KEM/ML-DSA, and every such
+ * operation guards with requirePQ() so a missed await fails loudly.
+ */
+export function loadPQ() {
+  if (!pqPromise) {
+    pqPromise = Promise.all([
+      import('@noble/post-quantum/ml-kem.js'),
+      import('@noble/post-quantum/ml-dsa.js'),
+    ]).then(([kem, dsa]) => {
+      ml_kem768 = kem.ml_kem768;
+      ml_dsa65 = dsa.ml_dsa65;
+    });
+  }
+  return pqPromise;
+}
+
+/**
+ * Fail loudly if the PQ graph is not loaded yet. Every method that touches
+ * ml_kem768 / ml_dsa65 calls this first, so a consumer that skipped
+ * `await loadPQ()` gets a descriptive error instead of a null dereference.
+ */
+function requirePQ() {
+  if (!ml_dsa65 || !ml_kem768) {
+    throw new Error(
+      'Post-quantum core (ML-KEM-768 / ML-DSA-65) is not loaded. ' +
+      'Await loadPQ() (via the crypto adapter) before the first keygen, ' +
+      'bundle sign/verify, or session encrypt/decrypt.'
+    );
+  }
+}
 
 /**
  * Bind a libsodium instance (libsodium-wrappers in Node, window.sodium in the
@@ -85,6 +133,7 @@ export class Identity {
       this.kemSk = keys.kemSk;             // ML-KEM-768 secret key
       this.kemPk = keys.kemPk;             // ML-KEM-768 public key
     } else {
+      requirePQ(); // fresh keygen needs ML-DSA-65 + ML-KEM-768
       const sigKp = ml_dsa65.keygen();
       this.signSk = sigKp.secretKey;
       this.signPk = sigKp.publicKey;
@@ -152,10 +201,12 @@ export class Identity {
   }
 
   sign(buf) {
+    requirePQ();
     return ml_dsa65.sign(buf, this.signSk);
   }
 
   static verify(signPk, buf, sig) {
+    requirePQ();
     try {
       return ml_dsa65.verify(sig, buf, signPk);
     } catch {
@@ -430,6 +481,7 @@ export class Session {
   }
 
   encrypt(plaintext) {
+    requirePQ(); // first send or ratchet step needs ML-KEM-768
     if (this.CKs === null) this._firstSend();
     const isFirst = this._isFirstMessage;
     this._isFirstMessage = false;
@@ -520,6 +572,7 @@ export class Session {
    * or burn the ratchet before its Poly1305 tag verifies.
    */
   decrypt(envelope) {
+    requirePQ(); // first receive / ratchet step needs ML-KEM-768 + ML-DSA-65 verify
     const snapshot = this._snapshot();
     try {
       return this._decryptChecked(envelope);

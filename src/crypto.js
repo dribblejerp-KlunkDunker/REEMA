@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const _sodium = require('libsodium-wrappers');
 
-import { Identity, Session, signingPayload, encodeBundle, decodeBundle, useSodium, RECEIPT, isReceipt } from '../public/crypto-core.js';
+import { Identity, Session, signingPayload, encodeBundle, decodeBundle, useSodium, loadPQ, RECEIPT, isReceipt } from '../public/crypto-core.js';
 
 /**
  * Node adapter for the shared post-quantum hybrid Double Ratchet core
@@ -19,7 +19,11 @@ export async function init() {
   await _sodium.ready;
   sodium = _sodium;
   useSodium(sodium);
+  // Deliberately does NOT await loadPQ(): ML-KEM/ML-DSA are fetched on first
+  // use (keygen, bundle sign/verify, or session establishment) so a process
+  // that only restores a persisted identity/sessions never parses the PQ
+  // graph. Consumers must await loadPQ() before their first PQ operation.
   return sodium;
 }
 
-export { Identity, Session, signingPayload, encodeBundle, decodeBundle, RECEIPT, isReceipt };
+export { Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, RECEIPT, isReceipt };
