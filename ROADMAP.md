@@ -323,3 +323,100 @@ Each item below is tied to a proving test in the tree. The encryption layer is
 **Remaining non-crypto items (documented, out of scope for the core):** relay
 metadata (mixnet), OS-keychain storage for the CLI identity key, and the
 residual encrypt→persist crash window (README Limitation 5).
+
+---
+
+## 7. Design — MLS group messaging (2026-08-18) 🟡
+
+Design sketch for multi-party (group) conversations mapped onto the existing
+v6 relay **without changing the client wire protocol**. Status: **design +
+relay prototype + client GroupSession prototype (2026-08-18)** —
+`isPlausibleEnvelope` accepts opaque `{ v: 6, mode: 'group', ciphertext }`
+envelopes and a `subscribe` verb enables fan-out/queued delivery; a client-side
+`GroupSession` (`public/group-core.js`) derives `groupId = BLAKE2b-32(creator ‖
+label ‖ nonce)` (the same 44-char b64 shape the relay routes on), welcomes
+members over existing pair sessions, encrypts under per-epoch shared keys
+(XSalsa20-Poly1305, per-sender counters), and ratchets epochs via encrypted
+Commit envelopes. The pair flow is byte-for-byte unchanged; `src/test.js`
+covers the whole lifecycle end-to-end through the real relay (junk rejection,
+fan-out, opacity, offline flush, welcome, replay/non-member rejection,
+epoch ratchet, and a member joining at epoch 1).
+
+### The core insight: the relay is already MLS's Delivery Service
+
+The current relay is a ciphertext-only, store-and-forward key directory —
+precisely MLS's **Delivery Service (DS) + Authentication Service (AS)**
+combined. Its verbs map 1:1:
+
+| Current v6 primitive | MLS (RFC 9420) equivalent |
+|---|---|
+| `publish {address, bundle, oneTimePrekeys}` | Publish a signed `KeyPackage` to the DS/AS |
+| `fetch-directory {address}` → bundle + one OTK | Fetch a member's `KeyPackage` to Add them |
+| `send {toPk, envelope, fromPk}` | `PrivateMessage` / `Welcome` / `Commit` addressed by `group_id` |
+| routing `address` — `BLAKE2b-32(signPk \|\| staticDhPk)`, 44-char b64 | `group_id` — any 32-byte value, **same 44-char b64 shape** |
+| `envelope` (opaque to the relay) | MLS message (opaque to the relay) |
+| OTK pool (consumed server-side on fetch) | `KeyPackage.init_key` (single-use HPKE) |
+| `online` / `inbox` maps | DS presence + store-and-forward queues |
+
+The decisive point: **`group_id` is structurally identical to today's routing
+address** — an opaque base64 blob used only as a `Map` key. The relay needs
+**zero new routing logic**; a group is "just another address" from its
+perspective.
+
+### What stays byte-for-byte (no wire change)
+
+- Newline TCP + WebSocket framing, and all four verb names (`publish`,
+  `fetch-directory`, `send`, `ping`).
+- The `online`, `inbox`, `directory` maps and their queue/sweep behavior.
+- Authenticated registration: the self-signed-bundle proof-of-possession check
+  becomes the KeyPackage signature check (same identity-pinning idea).
+
+### What changes client-side (the relay never sees it)
+
+1. **KeyPackage replaces the prekey bundle for group adds.** Today's
+   self-signed bundle is already ~80% of a KeyPackage — it carries the
+   credential (ML-DSA-65 `signPk`), the static/init DH keys (`staticDhPk`,
+   `signedDhPk`), and a self-signature. Add MLS's `init_key` (an ephemeral
+   HPKE public key), `cipher_suite`, and leaf extensions, published under the
+   same authenticated address.
+2. **`group_id` derivation.** `group_id = BLAKE2b-32(creator_address ||
+   group_label || nonce)` — 32 bytes, so it reuses the existing 44-char shape
+   the relay already treats as opaque.
+3. **Group lifecycle (all client-side):**
+   - **Create** — the creator `fetch-directory`s each invitee's KeyPackage,
+     builds a ratchet tree, and emits one `Commit` (to the group) plus one
+     `Welcome` per member (HPKE-encrypted to their `init_key`).
+   - **Add** — any member proposes `Add`; the committer sends `Commit` +
+     `Welcome`. The Welcome to the new member is a normal `send` to *their*
+     address.
+   - **Send** — an application message is `send {toPk: group_id, envelope:
+     mls_private_message}`.
+   - **Remove / leave** — a `Remove` proposal + `Commit`; every remaining
+     member advances the epoch and wipes the old epoch secrets.
+   - **One-time prekey exhaustion** — each Add consumes one KeyPackage; the
+     relay's existing consume-on-fetch behavior already matches MLS's "one
+     KeyPackage per Add" rule, and clients must replenish their published OTK
+     pool as it drains.
+
+### Security properties (what MLS buys, at what cost)
+
+- **Post-compromise security** — removing a member and ratcheting the tree
+  wipes old epoch secrets, so a leaked leaf key does not decrypt past or
+  future traffic after the next Commit.
+- **Sender authenticity** — application messages are signed by the sender's
+  leaf; membership changes are `Commit`-authenticated.
+- **The relay's exposure is unchanged** — it still sees only ciphertext,
+  addresses/group_ids, and timing; group membership and plaintext stay
+  client-side.
+
+### Open decisions before implementation
+
+1. **Which MLS library** — `openmls/openmls` or `awslabs/mls-rs` (both Rust →
+   WASM for the browser), vs. hand-rolling (not recommended — MLS is subtle;
+   the ratchet-tree machinery and validation rules are beyond what
+   `crypto-core.js` hand-derives today).
+2. **Where the ratchet tree lives** — client-side `localStorage`/disk,
+   encrypted by the identity key like `sessions.js` does today.
+3. **Welcome transport** — the prototype rides a normal `send` to the new
+   member's address inside an existing pair-session envelope (no new verb); a
+   dedicated `welcome` verb remains the alternative.
