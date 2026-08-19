@@ -26,6 +26,14 @@ import { stripControls } from './sanitize.js';
  * The directory also holds one-time prekeys, handed out one per fetch and
  * consumed server-side, so each new session bootstrap gets its own forward
  * secrecy. An exhausted pool degrades to a prekey-less bootstrap.
+ *
+ * Group mode (prototype — ROADMAP §7): the relay also carries OPAQUE
+ * group-mode envelopes ({ v: 6, mode: 'group', ciphertext }) to opaque
+ * group_ids, exactly as it carries pair-mode envelopes to routing addresses.
+ * The MLS message inside `ciphertext` is never parsed; a `subscribe` verb
+ * binds a connection to a group_id for fan-out. Members keep their own
+ * registered address and simply also listen on group ids, so authenticated
+ * registration is untouched.
  */
 
 const HOST = process.env.HOST || '127.0.0.1';
@@ -47,12 +55,25 @@ const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 // Pad the relay->client direction only — the relay cannot pad what it receives.
 const DELIVERY_PAD_BUCKET = 12 * 1024;
 
+// Group-mode (MLS) envelopes carry an opaque message in `ciphertext`. Cap it
+// at 128 KB decoded — generous for a PrivateMessage/Commit and a small-group
+// Welcome (which embeds the ratchet tree) — while staying well inside
+// MAX_LINE_BYTES after base64 inflation (128 KB * 4/3 ≈ 171 KB).
+const MAX_GROUP_ENVELOPE_BYTES = 128 * 1024;
+
 // recipientPk -> array of { envelope, fromPk, ts }
 const inbox = new Map();
 // recipientPk -> { type: 'tcp'|'ws', raw: socket }
 const online = new Map();
-// Key directory: address -> { bundle, oneTimePrekeys: Map(id -> { dhPk, signature }) }.
+// Key directory: address -> { bundle, oneTimePrekeys: Map(id -> { dhPk, signature }), keyPackage }.
+// `keyPackage` is an MLS-style KeyPackage (ROADMAP §7): shape/size-capped but
+// opaque — the relay stores and serves it so members can discover joinable
+// peers (the Add half of Add/Commit/Welcome), never parsing its contents.
 const directory = new Map();
+// Group delivery (prototype — ROADMAP §7): group_id -> Set<client> subscribed
+// to that id. Members register their own address as usual AND subscribe to
+// group ids, so group fan-out never touches the address/directory machinery.
+const groups = new Map();
 let sodium = null; // bound by init() before the servers listen
 
 // Sanitize control characters before echoing a key/address into the operator's
@@ -65,7 +86,6 @@ const short = (pk) => {
   if (typeof pk !== 'string') return '<invalid>';
   return stripControls(pk).slice(0, 16) + '...';
 };
-
 
 function isAlive(client) {
   if (!client) return false;
@@ -123,10 +143,60 @@ function queueMessage(toPk, envelope, fromPk) {
  * senderSignPk and header.pq_pk are OMITTED on steady-state non-first
  * messages (the receiver reconstructs them from cached values), so they are
  * required only on first messages and validated for size when present.
+ *
+ * Group mode ({ v: 6, mode: 'group', ciphertext }) is OPAQUE: the relay
+ * validates shape and encodability only — the MLS message inside ciphertext
+ * is never parsed, and the pair-mode header/bundle/OTK fields are
+ * intentionally absent (group members decrypt against their epoch key without
+ * the per-session ML-KEM allocation pair mode's strictness protects against).
+ * Optional senderSignPk (1952 B) and epoch (non-negative int) are still
+ * type/size-checked when present.
  */
+// MLS KeyPackage (ROADMAP §7): shape/size-capped but opaque — the relay
+// stores what the member publishes and serves it back unchanged. Checks cover
+// the MLS-ish envelope (version, cipher suite, 32-byte init_key, credential,
+// capabilities, extension list) and a hard size cap so junk cannot fill the
+// directory; the CONTENT is never parsed.
+const MAX_KEYPACKAGE_BYTES = 8 * 1024;
+function isPlausibleKeyPackage(kp) {
+  if (!kp || typeof kp !== 'object' || Array.isArray(kp)) return false;
+  if (!Number.isInteger(kp.version) || kp.version < 1) return false;
+  if (!Number.isInteger(kp.cipher_suite) || kp.cipher_suite < 0) return false;
+  if (typeof kp.init_key !== 'string' || !kp.init_key || Buffer.from(kp.init_key, 'base64').length !== 32) return false;
+  if (!kp.credential || typeof kp.credential !== 'object' || Array.isArray(kp.credential)
+      || typeof kp.credential.identity !== 'string' || !kp.credential.identity) return false;
+  if (!kp.capabilities || typeof kp.capabilities !== 'object' || Array.isArray(kp.capabilities)) return false;
+  if (!Array.isArray(kp.extensions)) return false;
+  for (const ext of kp.extensions) {
+    if (!ext || typeof ext !== 'object' || Array.isArray(ext)
+        || typeof ext.type !== 'string' || typeof ext.data !== 'string') return false;
+  }
+  if (Buffer.from(JSON.stringify(kp), 'utf8').length > MAX_KEYPACKAGE_BYTES) return false;
+  return true;
+}
+
 function isPlausibleEnvelope(env) {
   if (!env || typeof env !== 'object') return false;
   if (env.v !== 6) return false;
+
+  // Group mode (prototype — ROADMAP §7): accept an opaque MLS envelope. No
+  // header, bundle, nonce, or signature fields are required — the ciphertext
+  // IS the message. Shape/size checks keep the flood gate (junk must not
+  // reach every group member) without the relay parsing MLS.
+  if (env.mode === 'group') {
+    if (typeof env.ciphertext !== 'string' || !env.ciphertext) return false;
+    const gct = Buffer.from(env.ciphertext, 'base64');
+    if (gct.length === 0 || gct.length > MAX_GROUP_ENVELOPE_BYTES) return false;
+    if (env.senderSignPk !== undefined && (typeof env.senderSignPk !== 'string' ||
+        Buffer.from(env.senderSignPk, 'base64').length !== 1952)) return false;
+    if (env.epoch !== undefined && (!Number.isInteger(env.epoch) || env.epoch < 0)) return false;
+    // GroupSession envelopes (prototype — public/group-core.js) carry the
+    // sender's b64 address and a per-sender message counter so recipients can
+    // rebuild the AEAD nonce; validate them when present.
+    if (env.sender !== undefined && (typeof env.sender !== 'string' || !env.sender || env.sender.length > 128)) return false;
+    if (env.n !== undefined && (!Number.isInteger(env.n) || env.n < 0)) return false;
+    return true;
+  }
 
   const h = env.header;
   if (!h || typeof h !== 'object') return false;
@@ -143,14 +213,17 @@ function isPlausibleEnvelope(env) {
   // present; senderSignPk and pq_pk are mandatory on the first message.
   if (h.first === true && (typeof env.senderSignPk !== 'string' ||
       Buffer.from(env.senderSignPk, 'base64').length !== 1952)) return false;
-  if (env.senderSignPk !== undefined && Buffer.from(env.senderSignPk, 'base64').length !== 1952) return false;
+  if (env.senderSignPk !== undefined && (typeof env.senderSignPk !== 'string' ||
+      Buffer.from(env.senderSignPk, 'base64').length !== 1952)) return false;
   if (Buffer.from(h.dh, 'base64').length !== 32) return false;
   if (h.first === true && (typeof h.pq_pk !== 'string' ||
       Buffer.from(h.pq_pk, 'base64').length !== 1184)) return false;
-  if (h.pq_pk !== undefined && Buffer.from(h.pq_pk, 'base64').length !== 1184) return false;
+  if (h.pq_pk !== undefined && (typeof h.pq_pk !== 'string' ||
+      Buffer.from(h.pq_pk, 'base64').length !== 1184)) return false;
   if (h.first === true && (typeof h.pq_ct !== 'string' ||
       Buffer.from(h.pq_ct, 'base64').length !== 1088)) return false;
-  if (h.pq_ct && Buffer.from(h.pq_ct, 'base64').length !== 1088) return false;
+  if (h.pq_ct && (typeof h.pq_ct !== 'string' ||
+      Buffer.from(h.pq_ct, 'base64').length !== 1088)) return false;
 
   // First messages must carry a structurally-plausible prekey bundle.
   if (h.first === true) {
@@ -179,11 +252,19 @@ function handleLine(client, line) {
     return;
   }
 
-  switch (msg.type) {
+  // Defense-in-depth: a validation bug in any handler must degrade to a
+  // per-connection error, never an uncaught exception that kills the relay
+  // (the malformed-envelope crash regression in src/test.js).
+  try {
+    switch (msg.type) {
     case 'publish': {
-      const { address, bundle, oneTimePrekeys } = msg;
+      const { address, bundle, oneTimePrekeys, keyPackage } = msg;
       if (typeof address !== 'string' || !address || address.length > 128) {
         sendLine(client, { type: 'error', error: 'valid address required' });
+        return;
+      }
+      if (keyPackage !== undefined && !isPlausibleKeyPackage(keyPackage)) {
+        sendLine(client, { type: 'error', error: 'invalid key package' });
         return;
       }
 
@@ -216,7 +297,7 @@ function handleLine(client, line) {
           otkMap.set(otk.id, { id: otk.id, dhPk: otk.dhPk, signature: otk.signature });
         }
       }
-      directory.set(address, { bundle, oneTimePrekeys: otkMap });
+      directory.set(address, { bundle, oneTimePrekeys: otkMap, keyPackage: keyPackage || null });
 
       // Refuse to move an address currently held by a live connection.
       const existing = online.get(address);
@@ -268,7 +349,32 @@ function handleLine(client, line) {
         entry.oneTimePrekeys.delete(firstId);
         oneTimePrekey = { id: otk.id, dhPk: otk.dhPk, signature: otk.signature };
       }
-      sendLine(client, { type: 'directory', address, bundle: entry.bundle, oneTimePrekey });
+      sendLine(client, { type: 'directory', address, bundle: entry.bundle, oneTimePrekey, keyPackage: entry.keyPackage || null });
+      break;
+    }
+
+    case 'subscribe': {
+      // Group delivery (prototype — ROADMAP §7): bind this connection to a
+      // group_id so group-mode envelopes routed to that id are fanned out
+      // here. Deliberately does NOT touch the address/directory machinery —
+      // a member keeps its own bound address and simply also listens on
+      // group ids, so authenticated registration is unaffected. Queued group
+      // messages (sent while no member was online) are flushed on subscribe.
+      const { group } = msg;
+      if (typeof group !== 'string' || !group || group.length > 128) {
+        sendLine(client, { type: 'error', error: 'valid group id required' });
+        return;
+      }
+      let subs = groups.get(group);
+      if (!subs) { subs = new Set(); groups.set(group, subs); }
+      subs.add(client);
+      const queued = inbox.get(group) || [];
+      inbox.delete(group);
+      for (const item of queued) {
+        sendPadded(client, { type: 'message', envelope: item.envelope, fromPk: item.fromPk });
+      }
+      sendLine(client, { type: 'subscribed', group });
+      console.log(`[server] client subscribed to group ${short(group)} (delivered ${queued.length} queued)`);
       break;
     }
 
@@ -285,6 +391,27 @@ function handleLine(client, line) {
 
       console.log(`[server] relaying ciphertext to ${short(toPk)} (opaque to relay)`);
 
+      // Group-mode envelope (prototype — ROADMAP §7): fan out to every online
+      // subscriber of the group_id, or queue for the group if none are online.
+      if (envelope.mode === 'group') {
+        const subs = groups.get(toPk);
+        const members = subs ? [...subs].filter(isAlive) : [];
+        if (members.length) {
+          for (const m of members) {
+            sendPadded(m, { type: 'message', envelope, fromPk: msg.fromPk || null });
+          }
+        } else {
+          const result = queueMessage(toPk, envelope, msg.fromPk || null);
+          if (!result.ok) {
+            sendLine(client, { type: 'error', error: result.error });
+            return;
+          }
+        }
+        sendLine(client, { type: 'sent', toPk });
+        break;
+      }
+
+      // Pair flow (unchanged): route by registered address.
       const target = online.get(toPk);
       if (isAlive(target)) {
         sendPadded(target, { type: 'message', envelope, fromPk: msg.fromPk || null });
@@ -305,6 +432,10 @@ function handleLine(client, line) {
 
     default:
       sendLine(client, { type: 'error', error: `unknown type: ${stripControls(msg.type)}` });
+    }
+  } catch (err) {
+    sendLine(client, { type: 'error', error: 'internal error' });
+    console.error(`[server] unhandled error in handleLine: ${err.message}`);
   }
 }
 
@@ -351,6 +482,9 @@ function makeFrameReader(client, onOverflow) {
 
 function dropClient(client) {
   if (client.pk && online.get(client.pk) === client) online.delete(client.pk);
+  // Group subscriptions are connection-scoped: drop this client from every
+  // group's fan-out set so stale entries never accumulate (VULN-004 pattern).
+  for (const subs of groups.values()) subs.delete(client);
 }
 
 const server = createServer((socket) => {

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { init, Identity, Session, loadPQ } from './crypto.js';
+import { GroupSession, useSodium } from '../public/group-core.js';
 import { generateVaultIdentity, exportVault, importVault } from './vault.js';
 import { stripControls, shortKey } from './sanitize.js';
 
@@ -16,6 +17,8 @@ import { stripControls, shortKey } from './sanitize.js';
  *   - messages round-trip in both directions across a ratchet step
  *   - a third party cannot decrypt a relayed envelope
  *   - queued (offline) delivery works by derived routing address
+ *   - the relay survives malformed envelope field types (single-packet crash
+ *     regression: non-string senderSignPk/pq_pk/pq_ct must reject, not kill)
  *   - the relay sanitizes control characters in logged keys/addresses, so a
  *     crafted toPk cannot inject terminal escape sequences into its console
  *   - the shared stripControls() strips control bytes from peer message
@@ -85,6 +88,7 @@ function withTimeout(label, p, ms = 30000) {
 async function main() {
   const sodium = await init();
   await loadPQ(); // the whole suite does keygen + session work immediately
+  useSodium(sodium);
   const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
   const addr = (id) => b64(Identity.deriveAddress(id.signPk, id.pk));
   const otksOf = (id) => [...id.oneTimePrekeys.values()].map((kp) => ({
@@ -236,6 +240,40 @@ async function main() {
     console.log('[test] clients connected');
 
     const bobPublished = bobClient.once('published');
+    // ---- Malformed-envelope crash regression (relay must survive) ----
+    // A crafted `send` whose OPTIONAL envelope fields (senderSignPk / header.pq_pk /
+    // header.pq_ct) are non-strings used to throw ERR_INVALID_ARG_TYPE inside
+    // isPlausibleEnvelope, escape handleLine uncaught, and kill the whole relay
+    // process — a single-packet remote DoS over TCP or WebSocket. Feed every
+    // variant, then prove the relay still answers and still works below.
+    const junkClient = await connectTcp(RELAY_PORT);
+    clients.push(junkClient);
+    const junkBase = {
+      v: 6,
+      senderDhPk: 'A'.repeat(43) + '=',
+      header: { dh: 'A'.repeat(43) + '=', pn: 0, n: 0 },
+      nonce: 'A'.repeat(32),
+      ciphertext: 'QUJD',
+      signature: 'R0lG',
+    };
+    const junkVariants = [
+      ['senderSignPk:number', { ...junkBase, senderSignPk: 123 }],
+      ['senderSignPk:null', { ...junkBase, senderSignPk: null }],
+      ['senderSignPk:object', { ...junkBase, senderSignPk: {} }],
+      ['senderSignPk:boolean', { ...junkBase, senderSignPk: true }],
+      ['pq_pk:number', { ...junkBase, header: { ...junkBase.header, pq_pk: 123 } }],
+      ['pq_ct:number', { ...junkBase, header: { ...junkBase.header, pq_ct: 123 } }],
+      ['pq_ct:object', { ...junkBase, header: { ...junkBase.header, pq_ct: {} } }],
+    ];
+    for (const [label, envelope] of junkVariants) {
+      junkClient.send({ type: 'send', toPk: 'A'.repeat(43) + '=', envelope });
+    }
+    const alivePong = junkClient.once('pong');
+    junkClient.send({ type: 'ping' });
+    await withTimeout('relay pong after malformed envelopes', alivePong, 15000);
+    assert('relay survives malformed envelope field types (no crash)', true);
+    console.log('[test] relay alive after ' + junkVariants.length + ' malformed envelopes');
+
     const alicePublished = aliceClient.once('published');
     console.log('[test] publishing (authenticated, proof-of-possession)...');
     aliceClient.send({ type: 'publish', address: aliceAddr, bundle: alice.makeBundle(), oneTimePrekeys: otksOf(alice) });
@@ -313,6 +351,321 @@ async function main() {
     const carolMsg = await withTimeout('carol queued message', carolInbound);
     const carolPlain = new Session(carol, alice.makeBundle()).decrypt(carolMsg.envelope);
     console.log(`[test] Carol received queued message: "${carolPlain}"`);
+
+    // ---- Group-mode (MLS) envelopes (prototype — ROADMAP §7) ----
+    // The relay must carry OPAQUE group envelopes ({ v: 6, mode: 'group',
+    // ciphertext }) to opaque group_ids: accept well-formed ones, fan them out
+    // to online subscribers, queue them for late joiners, and keep rejecting
+    // junk — all without touching the pair flow exercised above.
+    {
+      const groupId = b64(sodium.randombytes_buf(32)); // opaque 44-char group_id
+      const groupMsg = (ciphertext, extra = {}) => ({ v: 6, mode: 'group', ciphertext, ...extra });
+
+      // Junk group envelopes are rejected (relay replies 'malformed envelope
+      // rejected' and does not deliver — and certainly must not crash).
+      const gJunk = await connectTcp(RELAY_PORT);
+      clients.push(gJunk);
+      const junkGroupVariants = [
+        ['missing ciphertext', groupMsg('')],
+        ['non-base64 ciphertext', groupMsg('!!!')],
+        ['wrong protocol version', { ...groupMsg('QUJD'), v: 5 }],
+        ['oversized ciphertext', groupMsg('A'.repeat(180 * 1024))],
+        ['senderSignPk wrong size', groupMsg('QUJD', { senderSignPk: 'AA==' })],
+        ['negative epoch', groupMsg('QUJD', { epoch: -1 })],
+        ['non-integer epoch', groupMsg('QUJD', { epoch: 1.5 })],
+        ['sender not a string', groupMsg('QUJD', { sender: 5 })],
+        ['negative n', groupMsg('QUJD', { n: -1 })],
+      ];
+      let groupJunkAllRejected = true;
+      for (const [label, envelope] of junkGroupVariants) {
+        const errP = gJunk.once('error');
+        gJunk.send({ type: 'send', toPk: groupId, envelope });
+        const err = await withTimeout(`group junk rejection (${label})`, errP);
+        if (!err || !/malformed envelope rejected/.test(err.error)) groupJunkAllRejected = false;
+      }
+      assert('relay rejects malformed group-mode envelopes (no crash)', groupJunkAllRejected);
+
+      // Online fan-out: two members subscribed to the group both receive the
+      // same opaque envelope, byte-for-byte as sent.
+      const gSender = await connectTcp(RELAY_PORT);
+      const gMemberA = await connectTcp(RELAY_PORT);
+      const gMemberB = await connectTcp(RELAY_PORT);
+      clients.push(gSender, gMemberA, gMemberB);
+      const subA = gMemberA.once('subscribed');
+      const subB = gMemberB.once('subscribed');
+      gMemberA.send({ type: 'subscribe', group: groupId });
+      gMemberB.send({ type: 'subscribe', group: groupId });
+      await withTimeout('group subscribe A', subA);
+      await withTimeout('group subscribe B', subB);
+
+      const gPayload = sodium.randombytes_buf(96); // opaque MLS-message stand-in
+      const gEnv = groupMsg(b64(gPayload), { epoch: 3 });
+      const msgA = gMemberA.once('message');
+      const msgB = gMemberB.once('message');
+      gSender.send({ type: 'send', toPk: groupId, envelope: gEnv, fromPk: aliceAddr });
+      const [recvA, recvB] = await withTimeout('group fan-out', Promise.all([msgA, msgB]));
+      assert('group envelope fanned out to every online subscriber',
+        recvA.envelope.mode === 'group' && recvB.envelope.mode === 'group' &&
+        recvA.envelope.ciphertext === gEnv.ciphertext && recvB.envelope.ciphertext === gEnv.ciphertext &&
+        recvA.envelope.epoch === 3 && recvB.envelope.epoch === 3);
+      assert('group envelope stays opaque to the relay (no pair fields added)',
+        recvA.envelope.header === undefined && recvA.envelope.nonce === undefined &&
+        recvA.envelope.signature === undefined);
+
+      // Offline queueing: sent to a group with no online subscriber, then
+      // flushed when a member subscribes. Uses a FRESH group id — members A/B
+      // are still subscribed to groupId above, so a send there would (correctly)
+      // fan out instead of queueing.
+      const groupId2 = b64(sodium.randombytes_buf(32));
+      const gEnv2 = groupMsg(b64(sodium.randombytes_buf(64)));
+      gSender.send({ type: 'send', toPk: groupId2, envelope: gEnv2, fromPk: aliceAddr });
+      await new Promise((r) => setTimeout(r, 50));
+      const gLate = await connectTcp(RELAY_PORT);
+      clients.push(gLate);
+      const lateSub = gLate.once('subscribed');
+      const lateMsg = gLate.once('message');
+      gLate.send({ type: 'subscribe', group: groupId2 });
+      await withTimeout('late group subscribe', lateSub);
+      const recvLate = await withTimeout('group queued delivery', lateMsg);
+      assert('queued group envelope flushed to a late subscriber',
+        recvLate.envelope.mode === 'group' && recvLate.envelope.ciphertext === gEnv2.ciphertext);
+    }
+
+    // ---- GroupSession prototype (ROADMAP §7): a client-side group over the
+    // real relay, reusing group_id as the routing address. Alice creates the
+    // group and welcomes Bob through their EXISTING pair session; group
+    // messages are opaque mode:'group' envelopes the relay fans out to
+    // subscribers. Bob joins at epoch 0; Alice then ratchets to epoch 1 to add
+    // Carol (Commit broadcast to the group, Welcome over a fresh pair
+    // first-message), and epoch-1 traffic flows to both members. ----
+    {
+      const aliceGroup = GroupSession.create({
+        creatorAddress: aliceAddr, label: 'ops-room', nonce: sodium.randombytes_buf(32),
+        members: [bobAddr], myAddress: aliceAddr,
+      });
+      const groupId = aliceGroup.groupId;
+      assert('group_id is a 44-char routing address (same shape as a pair address)',
+        /^[A-Za-z0-9+/]{43}=$/.test(groupId));
+
+      // Bob joins via the Welcome, delivered through the established pair
+      // session (the design's "Welcome is a normal send to *their* address").
+      const welcomePlain = await (async () => {
+        const p = bobClient.once('message');
+        aliceClient.send({ type: 'send', toPk: bobAddr, envelope: aliceSession.encrypt(Buffer.from(aliceGroup.makeWelcome(), 'utf8')), fromPk: aliceAddr });
+        const m = await withTimeout('bob welcome', p);
+        return bobSession.decrypt(m.envelope);
+      })();
+      const bobGroup = GroupSession.fromWelcome(welcomePlain, bobAddr);
+      assert('bob derives the same group_id from the welcome', bobGroup.groupId === groupId);
+      assert('welcome carries the epoch-0 member roster',
+        bobGroup.members.includes(bobAddr) && bobGroup.members.includes(aliceAddr));
+
+      // Both members subscribe (group delivery is fan-out to subscribers; a
+      // member receives its OWN sends back too — one-shot listeners discard
+      // those echoes). Alice sends the first group message at epoch 0.
+      const bobSub = bobClient.once('subscribed');
+      bobClient.send({ type: 'subscribe', group: groupId });
+      await withTimeout('bob group subscribe', bobSub);
+      const aliceSub = aliceClient.once('subscribed');
+      aliceClient.send({ type: 'subscribe', group: groupId });
+      await withTimeout('alice group subscribe', aliceSub);
+
+      const aEnv = aliceGroup.encrypt('hello group — first message');
+      const bobGotA1 = bobClient.once('message');
+      const sentA1 = aliceClient.once('sent');
+      aliceClient.send({ type: 'send', toPk: groupId, envelope: aEnv, fromPk: aliceAddr });
+      const [sentAck, a1Recv] = await withTimeout('A1 ack+delivery', Promise.all([sentA1, bobGotA1]));
+      assert('relay accepted the GroupSession envelope (sent ack)', sentAck.toPk === groupId);
+      const a1 = bobGroup.handleIncoming(a1Recv.envelope);
+      assert('bob decrypts the epoch-0 group message', a1.text === 'hello group — first message');
+
+      // Bob replies; Alice (also subscribed) receives it; Bob's own echo is
+      // discarded (no pending listener).
+      const bEnv = bobGroup.encrypt('reply from bob');
+      const aliceGotB1 = aliceClient.once('message');
+      const sentB1 = bobClient.once('sent');
+      bobClient.send({ type: 'send', toPk: groupId, envelope: bEnv, fromPk: bobAddr });
+      await withTimeout('B1 ack', sentB1);
+      const b1Recv = await withTimeout('B1 to alice', aliceGotB1);
+      const b1 = aliceGroup.handleIncoming(b1Recv.envelope);
+      assert('alice decrypts bob\'s group reply', b1.text === 'reply from bob');
+
+      // Replay + non-member rejection.
+      let replayRejected = false;
+      try { bobGroup.decrypt(aEnv); } catch { replayRejected = true; }
+      assert('bob rejects a replayed group message', replayRejected);
+      const malloryGroup = new GroupSession({
+        groupId, epoch: 0, epochKey: sodium.randombytes_buf(32),
+        members: [addr(mallory)], creator: aliceAddr, myAddress: addr(mallory),
+      });
+      let nonMemberRejected = false;
+      try { malloryGroup.decrypt(aEnv); } catch { nonMemberRejected = true; }
+      assert('a non-member (wrong epoch key) cannot decrypt', nonMemberRejected);
+
+      // Alice ratchets to epoch 1 to add Carol: Commit broadcast to the group
+      // (encrypted under the epoch-0 key), Welcome to Carol carrying the
+      // epoch-1 key over a fresh pair first-message.
+      const commitSecret = sodium.randombytes_buf(32);
+      const { commit, envelope: commitEnv } = aliceGroup.makeCommit({
+        secret: commitSecret, toMembers: [...aliceGroup.members, carolAddr],
+      });
+      aliceGroup.applyCommit(commit);
+      assert('alice advanced to epoch 1', aliceGroup.epoch === 1);
+
+      const bobGotCommit = bobClient.once('message');
+      const sentCommit = aliceClient.once('sent');
+      aliceClient.send({ type: 'send', toPk: groupId, envelope: commitEnv, fromPk: aliceAddr });
+      await withTimeout('commit ack', sentCommit);
+      const commitRecv = await withTimeout('bob commit', bobGotCommit);
+      const bobCommitRes = bobGroup.handleIncoming(commitRecv.envelope);
+      assert('bob applies the commit and ratchets to epoch 1',
+        !!bobCommitRes.commit && bobGroup.epoch === 1);
+      assert('epoch-1 membership includes carol', bobGroup.members.includes(carolAddr));
+
+      const carolWelcome = await (async () => {
+        const p = carolClient.once('message');
+        const s = new Session(alice, carol.makeBundle());
+        aliceClient.send({ type: 'send', toPk: carolAddr, envelope: s.encrypt(Buffer.from(aliceGroup.makeWelcome(), 'utf8')), fromPk: aliceAddr });
+        const m = await withTimeout('carol welcome', p);
+        return new Session(carol, alice.makeBundle()).decrypt(m.envelope);
+      })();
+      const carolGroup = GroupSession.fromWelcome(carolWelcome, carolAddr);
+      assert('carol joins at epoch 1 with the same group_id',
+        carolGroup.epoch === 1 && carolGroup.groupId === groupId);
+
+      const carolSub = carolClient.once('subscribed');
+      carolClient.send({ type: 'subscribe', group: groupId });
+      await withTimeout('carol group subscribe', carolSub);
+
+      // Epoch-1 traffic fans out to both members.
+      const cEnv = aliceGroup.encrypt('epoch 1 — carol can read this');
+      const carolGotC1 = carolClient.once('message');
+      const bobGotC1 = bobClient.once('message');
+      const sentC1 = aliceClient.once('sent');
+      aliceClient.send({ type: 'send', toPk: groupId, envelope: cEnv, fromPk: aliceAddr });
+      await withTimeout('C1 ack', sentC1);
+      const [c1Carol, c1Bob] = await withTimeout('C1 fan-out', Promise.all([carolGotC1, bobGotC1]));
+      const c1c = carolGroup.handleIncoming(c1Carol.envelope);
+      const c1b = bobGroup.handleIncoming(c1Bob.envelope);
+      assert('carol decrypts the epoch-1 message from alice', c1c.text === 'epoch 1 — carol can read this');
+      assert('bob still decrypts after the ratchet', c1b.text === 'epoch 1 — carol can read this');
+
+      const carolReply = carolGroup.encrypt('carol can send too');
+      const aliceGotC2 = aliceClient.once('message');
+      carolClient.send({ type: 'send', toPk: groupId, envelope: carolReply, fromPk: carolAddr });
+      const c2Recv = await withTimeout('C2 to alice', aliceGotC2);
+      const c2 = aliceGroup.handleIncoming(c2Recv.envelope);
+      assert('alice decrypts carol\'s epoch-1 reply', c2.text === 'carol can send too');
+    }
+
+    // ---- MLS KeyPackage plumbing (ROADMAP §7): the relay directory now also
+    // accepts an MLS-style KeyPackage per address, and the whole Add → Commit
+    // → Welcome flow rides the EXISTING four verbs — publish (carry the
+    // KeyPackage), fetch-directory (discover the joinable peer), send (Commit
+    // to the group, Welcome to the member's address), subscribe (bind to the
+    // group) — with no further relay changes. ----
+    {
+      // A fresh group; Bob joins at epoch 0 via Welcome over the pair session.
+      const group2 = GroupSession.create({
+        creatorAddress: aliceAddr, label: 'kp-room', nonce: sodium.randombytes_buf(32),
+        members: [bobAddr], myAddress: aliceAddr,
+      });
+      const groupId2 = group2.groupId;
+      const bobWelcome2 = await (async () => {
+        const p = bobClient.once('message');
+        aliceClient.send({ type: 'send', toPk: bobAddr, envelope: aliceSession.encrypt(Buffer.from(group2.makeWelcome(), 'utf8')), fromPk: aliceAddr });
+        const m = await withTimeout('bob welcome2', p);
+        return bobSession.decrypt(m.envelope);
+      })();
+      const bobGroup2 = GroupSession.fromWelcome(bobWelcome2, bobAddr);
+      assert('group2: bob joins at epoch 0', bobGroup2.groupId === groupId2 && bobGroup2.epoch === 0);
+      const bobSub2 = bobClient.once('subscribed');
+      bobClient.send({ type: 'subscribe', group: groupId2 });
+      await withTimeout('group2 bob subscribe', bobSub2);
+
+      // Malformed KeyPackages are rejected before touching the directory.
+      const kpJunk = [
+        ['not an object', 5],
+        ['missing init_key', { version: 1, cipher_suite: 2, credential: { identity: 'x' }, capabilities: {}, extensions: [] }],
+        ['init_key wrong size', { version: 1, cipher_suite: 2, init_key: b64(sodium.randombytes_buf(16)), credential: { identity: 'x' }, capabilities: {}, extensions: [] }],
+        ['extensions not an array', { version: 1, cipher_suite: 2, init_key: b64(sodium.randombytes_buf(32)), credential: { identity: 'x' }, capabilities: {}, extensions: 'nope' }],
+        ['bad extension shape', { version: 1, cipher_suite: 2, init_key: b64(sodium.randombytes_buf(32)), credential: { identity: 'x' }, capabilities: {}, extensions: [{ type: 5, data: 'x' }] }],
+      ];
+      let kpJunkAllRejected = true;
+      for (const [label, badKp] of kpJunk) {
+        const errP = aliceClient.once('error');
+        aliceClient.send({ type: 'publish', address: aliceAddr, bundle: alice.makeBundle(), oneTimePrekeys: otksOf(alice), keyPackage: badKp });
+        const err = await withTimeout(`keyPackage junk rejection (${label})`, errP);
+        if (!err || !/invalid key package/.test(err.error)) kpJunkAllRejected = false;
+      }
+      assert('relay rejects malformed MLS KeyPackages (no directory mutation)', kpJunkAllRejected);
+
+      // Carol publishes her KeyPackage bound to this group (Add discovery).
+      const carolKp = GroupSession.makeKeyPackage(carolAddr, { groupId: groupId2 });
+      const pubC = carolClient.once('published');
+      carolClient.send({ type: 'publish', address: carolAddr, bundle: carol.makeBundle(), oneTimePrekeys: otksOf(carol), keyPackage: carolKp });
+      await withTimeout('carol keyPackage publish', pubC);
+
+      // Add: Alice fetches Carol's KeyPackage via fetch-directory and verifies
+      // it is bound to this group — the discovery half of the flow.
+      const dirP = aliceClient.once('directory');
+      aliceClient.send({ type: 'fetch-directory', address: carolAddr });
+      const dirReply = await withTimeout('fetch carol keyPackage', dirP);
+      assert('directory serves carol\'s KeyPackage', !!dirReply.keyPackage && dirReply.keyPackage.credential.identity === carolAddr);
+      assert('KeyPackage round-trips byte-identical (opaque to the relay)',
+        JSON.stringify(dirReply.keyPackage) === JSON.stringify(carolKp));
+      assert('KeyPackage is bound to this group (group_id extension) and well-formed',
+        GroupSession.checkKeyPackage(dirReply.keyPackage, { groupId: groupId2 }).credential.identity === carolAddr);
+      let wrongGroupRejected = false;
+      try { GroupSession.checkKeyPackage(dirReply.keyPackage, { groupId: b64(sodium.randombytes_buf(32)) }); } catch { wrongGroupRejected = true; }
+      assert('a KeyPackage fetched for one group cannot Add into another', wrongGroupRejected);
+
+      // Commit: Alice ratchets group2 to epoch 1 adding Carol; the Commit
+      // envelope rides the group send verb to every online subscriber.
+      const commitSecret2 = sodium.randombytes_buf(32);
+      const { commit: commit2, envelope: commitEnv2 } = group2.makeCommit({
+        secret: commitSecret2, toMembers: [...group2.members, carolAddr],
+      });
+      group2.applyCommit(commit2);
+      const bobGotCommit2 = bobClient.once('message');
+      const sentCommit2 = aliceClient.once('sent');
+      aliceClient.send({ type: 'send', toPk: groupId2, envelope: commitEnv2, fromPk: aliceAddr });
+      await withTimeout('group2 commit ack', sentCommit2);
+      const commitRecv2 = await withTimeout('bob group2 commit', bobGotCommit2);
+      const bobCommit2 = bobGroup2.handleIncoming(commitRecv2.envelope);
+      assert('group2: bob applies the commit and ratchets to epoch 1',
+        !!bobCommit2.commit && bobGroup2.epoch === 1 && bobGroup2.members.includes(carolAddr));
+
+      // Welcome: Carol joins at epoch 1 via a fresh pair first-message — the
+      // KeyPackage only got her DISCOVERED; the key still rides the existing
+      // pair send verb to her own address.
+      const carolWelcome2 = await (async () => {
+        const p = carolClient.once('message');
+        const s = new Session(alice, carol.makeBundle());
+        aliceClient.send({ type: 'send', toPk: carolAddr, envelope: s.encrypt(Buffer.from(group2.makeWelcome(), 'utf8')), fromPk: aliceAddr });
+        const m = await withTimeout('carol welcome2', p);
+        return new Session(carol, alice.makeBundle()).decrypt(m.envelope);
+      })();
+      const carolGroup2 = GroupSession.fromWelcome(carolWelcome2, carolAddr);
+      assert('carol joins group2 at epoch 1 (KeyPackage-backed Add → Welcome)',
+        carolGroup2.groupId === groupId2 && carolGroup2.epoch === 1 && carolGroup2.members.includes(carolAddr));
+
+      // Carol subscribes and epoch-1 traffic flows to both members.
+      const carolSub2 = carolClient.once('subscribed');
+      carolClient.send({ type: 'subscribe', group: groupId2 });
+      await withTimeout('group2 carol subscribe', carolSub2);
+      const aliceSub2 = aliceClient.once('subscribed');
+      aliceClient.send({ type: 'subscribe', group: groupId2 });
+      await withTimeout('group2 alice subscribe', aliceSub2);
+      const cEnv2 = carolGroup2.encrypt('hello from carol via KeyPackage add');
+      const aliceGotC2b = aliceClient.once('message');
+      const sentC2 = carolClient.once('sent');
+      carolClient.send({ type: 'send', toPk: groupId2, envelope: cEnv2, fromPk: carolAddr });
+      await withTimeout('group2 carol send ack', sentC2);
+      const cRecv2 = await withTimeout('alice gets carol group2 msg', aliceGotC2b);
+      assert('alice decrypts carol\'s epoch-1 message (KeyPackage add worked end-to-end)',
+        group2.handleIncoming(cRecv2.envelope).text === 'hello from carol via KeyPackage add');
+    }
 
     // ---- Log-injection regression (VULN-005): a crafted `toPk` must not emit
     // terminal escape sequences into the relay's operator console. The send
