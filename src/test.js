@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { init, Identity, Session } from './crypto.js';
+import { generateVaultIdentity, exportVault, importVault } from './vault.js';
 import { stripControls } from './sanitize.js';
 
 /**
@@ -141,6 +142,42 @@ async function main() {
     assert('passes clean text through unchanged', stripControls('plain text') === 'plain text');
     assert('leaves non-strings alone', stripControls(null) === null && stripControls(42) === 42);
     console.log(`[test] bidi-sanitized: ${JSON.stringify(clean)}`);
+  }
+
+  // ---- Vault-at-rest (age format) round-trips ----
+  {
+    const { identity, recipient } = await generateVaultIdentity();
+    const secret = 'BLACKVAULT vault payload — age format';
+    const armored = await exportVault(secret, { recipient });
+    assert('vault export is PEM-armored age', armored.startsWith('-----BEGIN AGE ENCRYPTED FILE-----'));
+    assert('vault export/import round-trips through the age format',
+      await importVault(armored, { identities: [identity], asText: true }) === secret);
+    const pwArmored = await exportVault(secret, { passphrase: 'vault-passphrase-test' });
+    assert('vault passphrase export/import round-trips',
+      await importVault(pwArmored, { passphrase: 'vault-passphrase-test', asText: true }) === secret);
+    let wrongPwRejected = false;
+    try { await importVault(pwArmored, { passphrase: 'wrong', asText: true }); } catch { wrongPwRejected = true; }
+    assert('vault rejects a wrong passphrase', wrongPwRejected);
+    assert('vault raw-binary decrypt accepts a Buffer',
+      Buffer.from(await importVault(await exportVault(secret, { recipient, armor: false }), { identities: [identity] })).toString('utf8') === secret);
+
+    // Post-quantum hybrid recipient (X25519 + ML-KEM-768 at rest): the file
+    // must be wrapped in an mlkem768x25519 stanza and decrypt with the PQ
+    // identity — the classical path above is unaffected.
+    const hy = await generateVaultIdentity({ hybrid: true });
+    assert('hybrid identity uses the PQ prefix', hy.identity.startsWith('AGE-SECRET-KEY-PQ-1'));
+    assert('hybrid recipient uses the age1pq prefix', hy.recipient.startsWith('age1pq1'));
+    const hyArmored = await exportVault(secret, { recipient: hy.recipient });
+    // The stanza tag is an ASCII string in the RAW age format; the armored form
+    // re-encodes it as base64, so assert on the raw bytes.
+    const hyRaw = await exportVault(secret, { recipient: hy.recipient, armor: false });
+    assert('hybrid export wraps the file key in an mlkem768x25519 stanza',
+      Buffer.from(hyRaw).includes(Buffer.from('mlkem768x25519')));
+    assert('hybrid vault round-trips (PQ at rest)',
+      await importVault(hyArmored, { identities: [hy.identity], asText: true }) === secret);
+    let pqRejected = false;
+    try { await importVault(hyArmored, { identities: [identity], asText: true }); } catch { pqRejected = true; }
+    assert('a classical identity cannot open a hybrid vault', pqRejected);
   }
 
 

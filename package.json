@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@noble/post-quantum": "^0.6.1",
+    "age-encryption": "^0.3.0",
     "libsodium-wrappers": "^0.7.15",
     "socks": "^2.8.3",
     "ws": "^8.13.0"

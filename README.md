@@ -122,14 +122,16 @@ never transmitted, binding each envelope to one conversation.
 │   ├── xss-regression.js   # headless XSS regression for the Gemini render path (npm test)
 │   ├── messenger-smoke.js   # headless A-B-A smoke test of public/messenger.html (npm test)
 │   ├── doc-consistency.js  # doc-vs-code checks (bundle size, cited files, ports, npm-test stages)
-│   └── index.js       # keygen / bundle / pubkey / info
+│   ├── vault.js       # Node entry for the vault-at-rest layer (re-exports vault-core)
+│   └── index.js       # keygen / bundle / pubkey / info / vault-*
 ├── public/
 │   ├── crypto-core.js # shared Identity, Session (Double Ratchet), signingPayload
+│   ├── vault-core.js  # shared vault-at-rest core (age format) — Node + browser
 │   ├── browser-crypto.js   # thin browser adapter over crypto-core.js
-│   ├── index.html     # dashboard UI with an E2EE Network tab
+│   ├── index.html     # dashboard UI with an E2EE Network tab + age vault panel
 │   ├── messenger.html # minimal two-party messaging app over the same core
 │   ├── fonts/         # self-hosted fonts (SIL OFL 1.1) + local fonts.css
-│   └── vendor/        # vendored libsodium + @noble — no CDN at runtime
+│   └── vendor/        # vendored libsodium + @noble + age-encryption — no CDN at runtime
 └── tools/
     ├── vendor.mjs     # regenerate public/vendor from node_modules
     ├── fetch-fonts.mjs    # regenerate public/fonts from Google Fonts (latin subsets only)
@@ -217,6 +219,41 @@ The CLI routes through Tor (SOCKS5 on 127.0.0.1:9050) by default and **refuses
 to connect if Tor is unavailable**. Use `--no-tor` for a direct connection, or
 `--allow-direct-fallback` to try Tor and accept a direct link if it is not
 running.
+
+### Vault at rest (age format)
+
+Exported vaults are standard [age](https://age-encryption.org) files (the
+single implementation lives in `public/vault-core.js`, via the author's
+official `age-encryption` TypeScript package, vendored into `public/vendor/`),
+so a BlackVault backup decrypts with the `age`/`rage` CLIs and is never locked
+into this codebase. ASCII armor (PEM) is the default so a vault survives text
+transport:
+
+```bash
+node src/index.js vault-keygen                  # new age identity + age1... recipient
+node src/index.js vault-keygen --hybrid         # PQ hybrid (X25519 + ML-KEM-768) keypair
+node src/index.js vault-export <file> <age1...>  # -> <file>.age (PEM-armored)
+node src/index.js vault-import <file.age> <AGE-SECRET-KEY>  # decrypt to stdout
+```
+
+Passphrase encryption is available too — set `AGE_PASSPHRASE` and omit the
+recipient/identity argument. The programmatic API is `exportVault()` /
+`importVault()` (X25519 recipients, scrypt passphrases, and **post-quantum
+hybrid** X25519 + ML-KEM-768 recipients via `generateVaultIdentity({ hybrid:
+true })` — `AGE-SECRET-KEY-PQ-1...` / `age1pq1...`, wrapping the file key in an
+`mlkem768x25519` stanza so a quantum attacker cannot harvest-and-break the
+X25519 layer alone; needs age v1.2.0+ tooling). The format is standard
+age v1, so backups decrypt with the reference `age`/`rage` CLIs; the
+classical/passphrase/hybrid export-import round-trips are asserted in `npm test`.
+
+**The dashboard UI has a Vault at Rest panel** (E2EE Network tab): generate an
+age keypair (with a **PQ hybrid** checkbox for the ML-KEM-768 variant), encrypt
+a backup of the current E2EE identity (all 8 keypairs + one-time-prekey pool,
+the same JSON `persistIdentity` writes) to a recipient/passphrase,
+download/copy the armored `.age`, and later decrypt & restore it — the vault
+core is lazy-imported so nothing age-related loads at first paint. The headless
+browser E2E exports in one context and restores in another (both classical and
+hybrid), asserting the identity keys and routing address survive exactly.
 
 ---
 
