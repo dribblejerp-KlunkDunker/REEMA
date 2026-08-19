@@ -33,3 +33,17 @@ export function stripControls(s) {
   if (typeof s !== 'string') return s;
   return s.replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}]/gu, '');
 }
+
+/**
+ * Short, display-safe rendering of a key/address for a console log line,
+ * mirroring the relay's `short()`. The value may be wire-controlled (e.g. an
+ * envelope's `senderDhPk`, which the relay only validates as a non-empty
+ * string), so it must pass through stripControls() BEFORE the slice — slicing
+ * first would keep the first 16 raw bytes of an escape sequence intact.
+ * Non-strings render as "<invalid>" so a malformed value never crashes the
+ * display path.
+ */
+export function shortKey(pk) {
+  if (typeof pk !== 'string') return '<invalid>';
+  return stripControls(pk).slice(0, 16) + '...';
+}

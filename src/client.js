@@ -3,7 +3,7 @@ import { createTorSocket } from './tor.js';
 import { loadOrCreateIdentity, saveIdentity } from './identity.js';
 import { loadSessions, saveSessions } from './sessions.js';
 import { createInterface } from 'node:readline';
-import { stripControls } from './sanitize.js';
+import { stripControls, shortKey } from './sanitize.js';
 
 /**
  * E2EE messaging client (protocol v6).
@@ -261,22 +261,22 @@ async function main() {
 
           if (!sessions.has(senderPkB64)) {
             if (!selfConsistent(env)) {
-              console.error(`[client] dropped self-inconsistent envelope from ${senderPkB64.slice(0, 16)}...`);
+              console.error(`[client] dropped self-inconsistent envelope from ${shortKey(senderPkB64)}`);
               return;
             }
             if (env.header.first !== true || !env.header.bundle) {
-              console.error(`[client] dropped first contact without a prekey bundle from ${senderPkB64.slice(0, 16)}...`);
+              console.error(`[client] dropped first contact without a prekey bundle from ${shortKey(senderPkB64)}`);
               return;
             }
             let peer;
             try {
               peer = Identity.verifyBundle(env.header.bundle);
             } catch {
-              console.error(`[client] dropped envelope with invalid prekey bundle from ${senderPkB64.slice(0, 16)}...`);
+              console.error(`[client] dropped envelope with invalid prekey bundle from ${shortKey(senderPkB64)}`);
               return;
             }
             if (b64(peer.staticDhPk) !== senderPkB64 || b64(peer.signPk) !== env.senderSignPk) {
-              console.error(`[client] dropped envelope whose bundle does not match its signature from ${senderPkB64.slice(0, 16)}...`);
+              console.error(`[client] dropped envelope whose bundle does not match its signature from ${shortKey(senderPkB64)}`);
               return;
             }
             created = true;
@@ -306,9 +306,9 @@ async function main() {
           }
 
           if (isReceipt(plaintext)) {
-            console.log(`[client] receipt from ${senderPkB64.slice(0, 16)}... (session established)`);
+            console.log(`[client] receipt from ${shortKey(senderPkB64)} (session established)`);
           } else {
-            console.log(`\n[client] <<< from ${senderPkB64.slice(0, 16)}...`);
+            console.log(`\n[client] <<< from ${shortKey(senderPkB64)}`);
             console.log(`[client] <<< ${stripControls(plaintext)}`);
           }
           persist();

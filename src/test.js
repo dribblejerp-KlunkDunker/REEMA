@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { init, Identity, Session } from './crypto.js';
 import { generateVaultIdentity, exportVault, importVault } from './vault.js';
-import { stripControls } from './sanitize.js';
+import { stripControls, shortKey } from './sanitize.js';
 
 /**
  * Integration test: full E2EE messaging through the REAL relay (protocol v6).
@@ -142,6 +142,22 @@ async function main() {
     assert('passes clean text through unchanged', stripControls('plain text') === 'plain text');
     assert('leaves non-strings alone', stripControls(null) === null && stripControls(42) === 42);
     console.log(`[test] bidi-sanitized: ${JSON.stringify(clean)}`);
+  }
+
+  // ---- shortKey(): the CLI client displays wire-controlled values (an
+  // envelope's senderDhPk, which the relay only validates as a non-empty
+  // string) via `from ${shortKey(...)}`. Sanitization must happen BEFORE the
+  // 16-char slice, or a raw escape prefix would survive the truncation.
+  {
+    const evilPrefix = '\x1b[2J' + '\x1b]8;;evil\x1b\\' + 'A'.repeat(20);
+    const rendered = shortKey(evilPrefix);
+    assert('shortKey strips controls BEFORE slicing (raw escape prefix cannot survive)',
+      !/[\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(rendered));
+    assert('shortKey strips bidi controls', !shortKey('\u202e' + 'B'.repeat(20)).includes('\u202e'));
+    assert('shortKey caps at 16 chars with ellipsis', shortKey('C'.repeat(30)) === 'C'.repeat(16) + '...');
+    assert('shortKey returns <invalid> for non-strings',
+      shortKey(null) === '<invalid>' && shortKey(42) === '<invalid>' && shortKey(undefined) === '<invalid>');
+    assert('shortKey keeps printable payload text', rendered.includes('A'));
   }
 
   // ---- Vault-at-rest (age format) round-trips ----
@@ -309,6 +325,24 @@ async function main() {
       + 'Z'.repeat(44);
     aliceClient.send({ type: 'send', toPk: injectedPk, envelope: aliceSession.encrypt(Buffer.from('log injection probe', 'utf8')), fromPk: aliceAddr });
     await new Promise((r) => setTimeout(r, 100));
+
+    // ---- VULN-006-equivalent (client display): the relay validates
+    // senderDhPk only as a non-empty string, so a hostile envelope can carry
+    // control bytes in it — the CLI client's message-display path prints
+    // `from ${shortKey(senderPkB64)}` for exactly this value. Prove the
+    // crafted senderDhPk travels the REAL relay to the recipient (the sink is
+    // wire-reachable) and that shortKey() renders it control-free for the
+    // console.
+    const spoofEnv = new Session(mallory, bob.makeBundle()).encrypt(Buffer.from('spoofed sender', 'utf8'));
+    spoofEnv.senderDhPk = '\x1b[2J' + '\u202e' + 'E'.repeat(40);
+    const bobGotSpoof = bobClient.once('message');
+    aliceClient.send({ type: 'send', toPk: bobAddr, envelope: spoofEnv, fromPk: aliceAddr });
+    const spoofRecv = await withTimeout('bob spoofed sender', bobGotSpoof);
+    assert('relay forwards a control-laden senderDhPk (display sink is wire-reachable)',
+      spoofRecv.envelope.senderDhPk === spoofEnv.senderDhPk);
+    assert('shortKey renders the spoofed senderDhPk control-free for the client console',
+      !/[\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(shortKey(spoofRecv.envelope.senderDhPk))
+      && shortKey(spoofRecv.envelope.senderDhPk).endsWith('...'));
 
     console.log('\n=== Results ===');
     assert('relay never saw plaintext', !relayOut.includes(secret) && !relayErr.includes(secret)
