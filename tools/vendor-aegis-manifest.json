@@ -1,0 +1,52 @@
+{
+  "verdad-service.js": {
+    "sha256": "def9f2ffdbe9725bf806d69b7296ccd7f87bd885251df86c5020382ea97fa7fa",
+    "source": "verdad-service.js",
+    "sourceSha256": "def9f2ffdbe9725bf806d69b7296ccd7f87bd885251df86c5020382ea97fa7fa"
+  },
+  "keybinding.js": {
+    "sha256": "1eba359daa060db286bfd9fae65adfa04049474e03ec1bad19407ac2fd46841a",
+    "source": "keybinding.js",
+    "sourceSha256": "1eba359daa060db286bfd9fae65adfa04049474e03ec1bad19407ac2fd46841a"
+  },
+  "crypto.js": {
+    "sha256": "f9584bd02db30d5c9f7f4ced60d8e5e48e5b8729ebd77252c69a815328345389",
+    "source": "crypto.js",
+    "sourceSha256": "f9584bd02db30d5c9f7f4ced60d8e5e48e5b8729ebd77252c69a815328345389"
+  },
+  "factcheck.js": {
+    "sha256": "c1165a861c9b409609d61362705852cdcae99573560a4ddcd3944984ac4aef82",
+    "source": "factcheck.js",
+    "sourceSha256": "c1165a861c9b409609d61362705852cdcae99573560a4ddcd3944984ac4aef82"
+  },
+  "security.js": {
+    "sha256": "06d6a92d451f69f6d6bf79044337a481a452939652f99c172ff57f5f1b436cde",
+    "source": "security.js",
+    "sourceSha256": "06d6a92d451f69f6d6bf79044337a481a452939652f99c172ff57f5f1b436cde"
+  },
+  "ingest.js": {
+    "sha256": "99e169200ff296450cd22a9bbca70d93799912ed1bc5f7edc33d072f27948c3b",
+    "source": "ingest.js",
+    "sourceSha256": "99e169200ff296450cd22a9bbca70d93799912ed1bc5f7edc33d072f27948c3b"
+  },
+  "modules/verdad.js": {
+    "sha256": "e505dedc1af5422e0b6ad26bfc242e9e4dc77f8d629453cfcbae75750d7d8b4b",
+    "source": "modules/verdad.js",
+    "sourceSha256": "e505dedc1af5422e0b6ad26bfc242e9e4dc77f8d629453cfcbae75750d7d8b4b"
+  },
+  "attempts.js": {
+    "sha256": "5a5c7740bfcae3e8b64706c1c59a5b19791fa3952d445075090aa33a1a324166",
+    "source": "attempts.js",
+    "sourceSha256": "5a5c7740bfcae3e8b64706c1c59a5b19791fa3952d445075090aa33a1a324166"
+  },
+  "attemptlog.js": {
+    "sha256": "4cb7a13440c1e6eb3b4fc884b54986d5d178d204c0071150f83bc7e132b6dcf9",
+    "source": "attemptlog.js",
+    "sourceSha256": "4cb7a13440c1e6eb3b4fc884b54986d5d178d204c0071150f83bc7e132b6dcf9"
+  },
+  "confidence.js": {
+    "sha256": "1fc8c870b035d073c48422f93460886033964cae678e64527ffb86c5fc229baa",
+    "source": "confidence.js",
+    "sourceSha256": "1fc8c870b035d073c48422f93460886033964cae678e64527ffb86c5fc229baa"
+  }
+}
