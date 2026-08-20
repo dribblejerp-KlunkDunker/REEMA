@@ -27,8 +27,13 @@
   #feed { display:flex; flex-direction:column; gap:8px; min-height:220px; max-height:52vh; overflow-y:auto; }
   .msg { max-width:78%; padding:9px 12px; border-radius:10px; background:#26282f; align-self:flex-start; }
   .msg.sent { background:#3a3423; align-self:flex-end; }
+  .msg.group { border-left:3px solid var(--acc); }
   .msg .t { font-size:14px; }
   .msg .m { font-size:11px; color:var(--dim); margin-top:3px; }
+  .msg .flag { font-size:11px; color:var(--bad); margin-top:6px; padding-top:6px; border-top:1px solid var(--line); }
+  .msg .flag.caution { color:var(--acc); }
+  .msg.rebuttal { border-left:3px solid var(--ok); }
+  .msg.rebuttal.bad { border-left:3px solid var(--bad); }
   .empty { color:var(--dim); text-align:center; padding:40px 0; }
   .addressbox { display:flex; gap:8px; align-items:center; }
   .addressbox .mono { flex:1; }
@@ -41,6 +46,23 @@
     <h1>Messenger <span class="muted">— protocol v6, post-quantum hybrid</span></h1>
     <span id="status" class="off">RELAY: connecting…</span>
   </div>
+
+  <details class="panel" style="border-color:var(--acc);">
+    <summary style="cursor:pointer;font-weight:600;">🔒 Privacy — what this protects and what it does not</summary>
+    <div class="muted" style="margin-top:8px;line-height:1.6;">
+      <strong style="color:var(--text);">Protected:</strong> your message <em>content</em> is end-to-end encrypted
+      (post-quantum hybrid) — the relay never sees plaintext.<br>
+      <strong style="color:var(--text);">Not yet protected:</strong> the relay still sees <em>who talks to whom,
+      when, and group membership</em>; mixing and cover traffic only hide <em>timing</em>, and only when several
+      messages share a window.<br>
+      <strong style="color:var(--text);">Transport:</strong> the client→relay link is TLS by default. Your IP is hidden
+      from the relay <em>only</em> if you launched this page through the Tor shell (<span class="mono">npm run
+      messenger-tor</span> to a remote relay); a direct loopback or remote connection still exposes your IP.<br>
+      <strong style="color:var(--text);">No messenger can protect:</strong> a compromised device, a group member
+      who leaks, or correlation with the physical world. Anonymity is only as strong as the least careful member.
+      See <span class="mono">ANONYMITY.md</span> for the full threat model.
+    </div>
+  </details>
 
   <div class="panel">
     <div class="muted" style="margin-bottom:8px">Your bound routing address — share it (44 chars). Your peer's client resolves it via the relay's key directory.</div>
@@ -55,6 +77,26 @@
     <div class="row">
       <input type="text" id="peer-input" placeholder="peer address or prekey bundle" autocomplete="off">
       <button id="connect">Connect</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="muted" style="margin-bottom:8px">Group channels (prototype — ROADMAP §7): create one with a roster, or join one with a Welcome. A group is just an address to the relay, which fans out opaque envelopes to subscribers.</div>
+    <div class="row" id="group-tabs-row" style="display:none">
+      <span class="muted" style="font-size:12px">Groups:</span>
+      <div id="group-tabs" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input type="text" id="group-label" placeholder="group label" autocomplete="off">
+      <input type="text" id="group-members" placeholder="members (comma-separated addresses)" autocomplete="off">
+      <button class="ghost" id="new-group">New Group</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input type="text" id="group-welcome" placeholder="or paste a Welcome JSON to join" autocomplete="off">
+      <button class="ghost" id="join-group">Join</button>
+    </div>
+    <div class="row" id="invite-row" style="display:none;margin-top:8px">
+      <input type="text" id="group-welcome-out" readonly class="mono" placeholder="This group's Welcome — send it to a member to invite">
     </div>
   </div>
 
@@ -76,8 +118,8 @@
   </div>
 </div>
 
-<script defer src="./vendor/libsodium/libsodium.js"></script>
-<script defer src="./vendor/libsodium/libsodium-wrappers.js"></script>
+<!-- libsodium is injected by public/browser-crypto.js on first init() (idle
+     bootstrap) — ~192 KB brotli kept out of the initial parse. -->
 <script type="importmap">
 {
   "imports": {
@@ -88,20 +130,74 @@
 }
 </script>
 <script type="module">
-import { init, Identity, Session, decodeBundle, RECEIPT, isReceipt } from './browser-crypto.js';
+import { init, Identity, Session, decodeBundle, loadPQ, RECEIPT, isReceipt, directoryShard, selectOneTimePrekey } from './browser-crypto.js';
+import { stripControls } from './sanitize.js';
+import { GroupSession, useSodium } from './group-core.js';
+import { analyzeMessage, shouldShare } from './aegis/verdad-service.js';
+import { AegisCrypto } from './aegis/crypto.js';
+import { signKeyBinding, verifyKeyBinding } from './aegis/keybinding.js';
+import { recordAttempt, CONTEXTS } from './aegis/attempts.js';
 
 const OTK_POOL_SIZE = 20;
 const IDENTITY_KEY = 'messenger_identity';
 const SESSIONS_KEY = 'messenger_sessions';
+const GROUPS_KEY = 'messenger_groups';
+const AEGIS_DID_KEY = 'aegis_did_identity';
+const AEGIS_BINDING_KEY = 'aegis_binding';
+const AEGIS_REBUTTAL = 'PrebunkRebuttal';
+
+// ---- Bootstrap timing probe (messenger smoke test) ----
+// Records when the page first paints (FCP, with a first-rAF fallback) and
+// when the E2EE identity first exists, so src/messenger-smoke.js can assert
+// the idle-deferred bootstrap never blocks first paint: identity creation
+// must not precede first paint. Mirrored to localStorage because the smoke
+// test's page.evaluate runs in an isolated world — same-origin storage is
+// shared, the window global is not. Harmless in production.
+window.__e2eeBootstrapTiming = { fcpMs: null, identityMs: null };
+const storeTiming = () => {
+  try { localStorage.setItem('__e2ee_timing', JSON.stringify(window.__e2eeBootstrapTiming)); } catch { /* private mode */ }
+};
+try {
+  new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+      if (entry.name === 'first-contentful-paint' && window.__e2eeBootstrapTiming.fcpMs === null) {
+        window.__e2eeBootstrapTiming.fcpMs = entry.startTime;
+        storeTiming();
+      }
+    }
+  }).observe({ type: 'paint', buffered: true });
+} catch { /* engines without PerformanceObserver: fall back to first rAF */ }
+if (window.__e2eeBootstrapTiming.fcpMs === null) {
+  const markPaint = () => {
+    if (window.__e2eeBootstrapTiming.fcpMs === null) {
+      window.__e2eeBootstrapTiming.fcpMs = performance.now();
+      storeTiming();
+    }
+  };
+  requestAnimationFrame(markPaint);
+  addEventListener('load', markPaint);
+}
+const markIdentityExists = () => {
+  if (window.__e2eeBootstrapTiming.identityMs === null) {
+    window.__e2eeBootstrapTiming.identityMs = performance.now();
+    storeTiming();
+  }
+};
 
 let sodium, myId, ws = null;
 let myPk = '', myAddress = '';
-let pendingDirectory = null;          // { resolve, reject } for fetch-directory
+let pendingDirectory = null;          // { resolve, reject } for a directory-shard fetch
 let sessions = new Map();             // peerDhPkB64 -> Session
 const peerAddresses = new Map();      // peerDhPkB64 -> 44-char routing address
 let activePeer = null;                // peerDhPkB64
 let activeAddress = '';               // routing address of the active peer
 let activePeerBundle = '';            // original bundle string (for reconnect/reload)
+let groups = new Map();               // groupId -> GroupSession
+let activeGroup = null;               // groupId currently routed by Send
+let myDid = '';                       // AEGIS attestation identity (did:key)
+let myDidJwk = null;                  // public JWK of that identity
+let myDidPrivateJwk = null;           // private JWK (extractable; device-local, like Reema's own keys)
+let myBinding = null;                 // cached KeyBinding credential (DID -> routing address)
 
 const $ = (id) => document.getElementById(id);
 const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
@@ -121,25 +217,35 @@ function persistIdentity() {
   }));
 }
 
-function loadOrCreateIdentity() {
+async function loadOrCreateIdentity() {
   const saved = localStorage.getItem(IDENTITY_KEY);
+  let restored = false;
   if (saved) {
-    const d = JSON.parse(saved);
-    if (d.dhSk && d.signSk && d.signedDhSk && d.kemSk) {
-      myId = new Identity({
-        signSk: unb64(d.signSk), signPk: unb64(d.signPk),
-        sk: unb64(d.dhSk), pk: unb64(d.dhPk),
-        signedDhSk: unb64(d.signedDhSk), signedDhPk: unb64(d.signedDhPk),
-        kemSk: unb64(d.kemSk), kemPk: unb64(d.kemPk),
-      });
-      for (const [id, kp] of Object.entries(d.oneTimePrekeys || {})) {
-        myId.oneTimePrekeys.set(Number(id), { id: Number(id), sk: unb64(kp.dhSk), pk: unb64(kp.dhPk), signature: unb64(kp.signature) });
+    try {
+      const d = JSON.parse(saved);
+      if (d.dhSk && d.signSk && d.signedDhSk && d.kemSk) {
+        myId = new Identity({
+          signSk: unb64(d.signSk), signPk: unb64(d.signPk),
+          sk: unb64(d.dhSk), pk: unb64(d.dhPk),
+          signedDhSk: unb64(d.signedDhSk), signedDhPk: unb64(d.signedDhPk),
+          kemSk: unb64(d.kemSk), kemPk: unb64(d.kemPk),
+        });
+        for (const [id, kp] of Object.entries(d.oneTimePrekeys || {})) {
+          myId.oneTimePrekeys.set(Number(id), { id: Number(id), sk: unb64(kp.dhSk), pk: unb64(kp.dhPk), signature: unb64(kp.signature) });
+        }
+        restored = true;
       }
-    }
+    } catch { /* corrupted identity — fall through to fresh keygen */ }
   }
+  // Deferred PQ: the ML-KEM/ML-DSA graph is fetched only when it is actually
+  // needed — fresh keygen or topping up a depleted OTK pool. A returning user
+  // with a full pool restores its identity without parsing any PQ code; the
+  // graph is first fetched at registration (publishToRelay) or first session.
+  if (!restored || myId.oneTimePrekeys.size < OTK_POOL_SIZE) await loadPQ();
   if (!myId) myId = new Identity();
   myId.newOneTimePrekeys(OTK_POOL_SIZE);
   persistIdentity();
+  markIdentityExists(); // identity now exists (restored keys, or keygen above)
   myPk = b64(myId.pk);
   myAddress = b64(Identity.deriveAddress(myId.signPk, myId.pk));
 }
@@ -172,16 +278,55 @@ function loadSessions() {
 }
 
 // ---- Relay ----
-function publishToRelay() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const otks = [...myId.oneTimePrekeys.values()].map((k) => ({ id: k.id, dhPk: b64(k.pk), signature: b64(k.signature) }));
-  ws.send(JSON.stringify({ type: 'publish', address: myAddress, bundle: myId.makeBundle(), oneTimePrekeys: otks }));
+// The shareable prekey bundle is static per identity (public key material +
+// a self-signature over it), so it is cached after the first publish.
+// Re-publishing a returning user's cached bundle needs no ML-DSA-65 — the
+// only PQ need in the registration path — so the @noble/post-quantum graph
+// is not fetched on reload until a session is established. A rotated
+// identity has a different staticDhPk, so the cache naturally misses.
+function myCachedBundle() {
+  const cached = localStorage.getItem('messenger_bundle_v6');
+  if (cached) {
+    try {
+      const bundle = JSON.parse(cached);
+      if (bundle && bundle.v === 6 && bundle.staticDhPk === b64(myId.pk)) return bundle;
+    } catch { /* corrupted cache — rebuild */ }
+  }
+  return null;
 }
-function fetchDirectory(address) {
-  return new Promise((resolve, reject) => {
+function buildCachedBundle() {
+  const bundle = myId.makeBundle();
+  localStorage.setItem('messenger_bundle_v6', JSON.stringify(bundle));
+  return bundle;
+}
+async function publishToRelay() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  let bundle = myCachedBundle();
+  if (!bundle) {
+    await loadPQ(); // fresh identity: self-sign the bundle now (PQ from keygen)
+    bundle = buildCachedBundle();
+  }
+  const otks = [...myId.oneTimePrekeys.values()].map((k) => ({ id: k.id, dhPk: b64(k.pk), signature: b64(k.signature) }));
+  ws.send(JSON.stringify({ type: 'publish', address: myAddress, bundle, oneTimePrekeys: otks }));
+}
+async function fetchDirectory(address) {
+  // Private directory lookup (ANONYMITY.md Phase 1): fetch the WHOLE shard, so
+  // the relay only learns "fetched shard #k" — never which address was wanted.
+  const msg = await new Promise((resolve, reject) => {
     pendingDirectory = { resolve, reject };
-    ws.send(JSON.stringify({ type: 'fetch-directory', address }));
+    ws.send(JSON.stringify({ type: 'fetch-shard', shard: directoryShard(address, 1) }));
   });
+  const entry = (msg.entries || []).find((e) => e.address === address);
+  if (!entry) throw new Error('address not in shard (peer not registered)');
+  const peer = Identity.verifyBundle(entry.bundle);
+  if (b64(Identity.deriveAddress(peer.signPk, peer.staticDhPk)) !== address) {
+    throw new Error('shard entry does not match its bundle (tampered relay)');
+  }
+  const oneTimePrekey = selectOneTimePrekey(myAddress, address, entry.oneTimePrekeys || []);
+  if (oneTimePrekey && !Identity.verifyOneTimePrekey(peer.signPk, oneTimePrekey)) {
+    throw new Error('shard served a one-time prekey not signed by the peer');
+  }
+  return { bundle: entry.bundle, oneTimePrekey };
 }
 
 // ---- UI ----
@@ -190,20 +335,35 @@ function setStatus(on, text) {
   el.className = on ? 'on' : 'off';
   el.textContent = `RELAY: ${text}`;
 }
-function addMessage(text, sent) {
-  const feed = $('feed');
-  const empty = feed.querySelector('.empty');
-  if (empty) empty.remove();
+function addMessage(text, sent, kind, verdict) {
   const div = document.createElement('div');
-  div.className = 'msg' + (sent ? ' sent' : '');
-  const t = document.createElement('div'); t.className = 't'; t.textContent = text;
-  const m = document.createElement('div'); m.className = 'm'; m.textContent = sent ? 'sent' : 'received';
+  div.className = 'msg' + (sent ? ' sent' : '') + (kind === 'group' ? ' group' : '');
+  // textContent already prevents HTML injection; stripControls additionally
+  // strips ESC/C0/C1 and bidi/format controls so a peer's plaintext cannot
+  // smuggle terminal escape sequences or Trojan-Source reordering/hiding into
+  // the rendered feed (browser twin of the CLI's VULN-006 handling).
+  const t = document.createElement('div'); t.className = 't'; t.textContent = stripControls(text);
+  const m = document.createElement('div'); m.className = 'm';
+  m.textContent = kind === 'group' ? (sent ? 'group · sent' : 'group · received') : (sent ? 'sent' : 'received');
   div.appendChild(t); div.appendChild(m);
-  feed.appendChild(div);
-  feed.scrollTop = feed.scrollHeight;
+  // Client-side inbound verdict flag (the relay never sees this analysis).
+  if (!sent && verdict && (verdict.recommendation === 'caution' || verdict.recommendation === 'block')) {
+    const f = document.createElement('div');
+    f.className = 'flag' + (verdict.recommendation === 'caution' ? ' caution' : '');
+    f.dataset.verdict = verdict.recommendation;
+    f.dataset.risk = String(Math.round(verdict.manipulationRisk || 0));
+    f.textContent = (verdict.recommendation === 'block' ? '🛑 ' : '⚠️ ') +
+      'manipulation risk ' + Math.round(verdict.manipulationRisk || 0) + '% — ' +
+      stripControls(verdict.reason || '');
+    div.appendChild(f);
+  }
+  appendFeedNode(div);
+  return div;
 }
 function setActive(pk, address, bundleStr) {
   activePeer = pk;
+  activeGroup = null; // pair and group views are mutually exclusive
+  [...document.querySelectorAll('#group-tabs button')].forEach((b) => { b.style.borderColor = ''; });
   activeAddress = address || '';
   activePeerBundle = bundleStr || '';
   if (activeAddress) peerAddresses.set(pk, activeAddress);
@@ -212,10 +372,350 @@ function setActive(pk, address, bundleStr) {
   $('peer-input').value = activePeerBundle || activeAddress || pk;
 }
 
+// ---- AEGIS brain (VERDAD gate + DID binding) ----
+// The messenger runs TWO identities (see the AEGIS seam design): the Reema
+// routing address (X25519 + ML-DSA/ML-KEM) above for transport, and a separate
+// AEGIS DID (ECDSA P-256) for attestations. The DID is generated device-locally
+// and bound to the routing address with a self-signed KeyBinding credential, so
+// a peer can check that a DID-signed rebuttal came from the same party as the
+// encrypted session. Content of defense travels; keys never leave this device.
+async function loadOrCreateDid() {
+  const saved = localStorage.getItem(AEGIS_DID_KEY);
+  if (saved) {
+    try {
+      const d = JSON.parse(saved);
+      if (d.did && d.publicKeyJwk && d.privateKeyJwk && AegisCrypto.jwkToDidKey(d.publicKeyJwk) === d.did) {
+        myDid = d.did; myDidJwk = d.publicKeyJwk; myDidPrivateJwk = d.privateKeyJwk;
+        return;
+      }
+    } catch { /* corrupt identity — regenerate */ }
+  }
+  const { did, publicKeyJwk, privateKeyJwk } = await AegisCrypto.generateKeyPair({ extractable: true });
+  myDid = did; myDidJwk = publicKeyJwk; myDidPrivateJwk = privateKeyJwk;
+  localStorage.setItem(AEGIS_DID_KEY, JSON.stringify({ v: 1, did, publicKeyJwk, privateKeyJwk }));
+}
+
+// Build (or reuse the cached) binding credential for THIS DID -> THIS address.
+// Rebuilt whenever the routing address rotates, so a stale binding never ships.
+async function getBinding() {
+  if (myBinding && myBinding.issuer === myDid && myBinding.credentialSubject?.routingAddress === myAddress) return myBinding;
+  const cached = localStorage.getItem(AEGIS_BINDING_KEY);
+  if (cached) {
+    try {
+      const c = JSON.parse(cached);
+      if (c.issuer === myDid && c.credentialSubject?.routingAddress === myAddress) { myBinding = c; return c; }
+    } catch { /* stale — rebuild */ }
+  }
+  const binding = await signKeyBinding(myDidPrivateJwk, {
+    did: myDid,
+    routingAddress: myAddress,
+    signPk: b64(myId.signPk),
+    publicKeyJwk: myDidJwk,
+    boundAt: new Date().toISOString()
+  });
+  localStorage.setItem(AEGIS_BINDING_KEY, JSON.stringify(binding));
+  myBinding = binding;
+  return binding;
+}
+
+function parseAegisPayload(plaintext) {
+  if (typeof plaintext !== 'string') return null;
+  const t = plaintext.trim();
+  if (!t.startsWith('{')) return null;
+  try {
+    const obj = JSON.parse(t);
+    return (obj && obj.__aegis === AEGIS_REBUTTAL) ? obj : null;
+  } catch { return null; }
+}
+
+// Sign a prebunk rebuttal for a flagged claim under the DID, carrying the
+// KeyBinding credential so the recipient can verify the DID is bound to the
+// exact routing address this message came from.
+async function buildRebuttal(claimText, verdict) {
+  const statement = {
+    type: AEGIS_REBUTTAL,
+    claimSha256: await AegisCrypto.computeHash(claimText),
+    prebunkText: `${verdict.headline || ''} ${verdict.reason || ''}`.trim(),
+    recommendation: verdict.recommendation,
+    createdAt: new Date().toISOString()
+  };
+  const jws = await AegisCrypto.signStatement(myDidPrivateJwk, statement);
+  return {
+    __aegis: AEGIS_REBUTTAL,
+    statement,
+    did: myDid,
+    binding: await getBinding(),
+    proof: { type: 'JsonWebSignature2020', jws }
+  };
+}
+
+// Verify a received rebuttal, failing closed on every step: (1) the KeyBinding
+// credential is valid, (2) it binds the DID to the sender's routing address,
+// (3) the embedded public key matches the DID, (4) the signature over the
+// statement is valid. Any mismatch rejects.
+async function verifyRebuttal(payload, senderAddress) {
+  try {
+    if (!payload || payload.__aegis !== AEGIS_REBUTTAL) return { ok: false, reason: 'not a rebuttal' };
+    const { statement, did, binding, proof } = payload;
+    if (!statement || !did || !binding || !proof?.jws) return { ok: false, reason: 'malformed rebuttal' };
+    if (typeof did !== 'string' || !did.startsWith('did:key:')) return { ok: false, reason: 'bad DID' };
+    const bres = await verifyKeyBinding(binding);
+    if (!bres.ok) return { ok: false, reason: 'binding: ' + bres.reason };
+    if (binding.issuer !== did) return { ok: false, reason: 'binding issuer mismatch' };
+    if (binding.credentialSubject?.routingAddress !== senderAddress) return { ok: false, reason: 'binding address mismatch' };
+    const jwk = binding.publicKeyJwk;
+    if (!jwk || AegisCrypto.jwkToDidKey(jwk) !== did) return { ok: false, reason: 'public key mismatch' };
+    const ok = await AegisCrypto.verifyStatement(jwk, statement, proof.jws);
+    return ok ? { ok: true, did, statement } : { ok: false, reason: 'signature mismatch' };
+  } catch (err) {
+    return { ok: false, reason: err?.message || String(err) };
+  }
+}
+
+function appendFeedNode(div) {
+  const feed = $('feed');
+  const empty = feed.querySelector('.empty');
+  if (empty) empty.remove();
+  feed.appendChild(div);
+  feed.scrollTop = feed.scrollHeight;
+  return div;
+}
+
+// Pre-send gate UI: advisory, never enforced. The operator sees the reason and
+// can confirm ("Send anyway") or cancel. Nothing leaves the device until they
+// choose.
+function renderGate(gate, text) {
+  const div = document.createElement('div');
+  div.className = 'msg sent';
+  div.dataset.gate = 'blocked';
+  const t = document.createElement('div'); t.className = 't';
+  t.textContent = '🛡️ VERDAD gate: ' + gate.headline + ' ' + gate.reason;
+  div.appendChild(t);
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:8px;margin-top:8px;';
+  const confirm = document.createElement('button');
+  confirm.textContent = 'Send anyway';
+  confirm.dataset.gateAction = 'confirm';
+  confirm.style.cssText = 'padding:6px 12px;font-size:12px;';
+  confirm.onclick = () => { div.remove(); deliverMessage(text); };
+  const cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  cancel.className = 'ghost';
+  cancel.dataset.gateAction = 'cancel';
+  cancel.style.cssText = 'padding:6px 12px;font-size:12px;';
+  cancel.onclick = () => { div.remove(); };
+  row.appendChild(confirm); row.appendChild(cancel);
+  div.appendChild(row);
+  appendFeedNode(div);
+}
+
+// Analyze an inbound message and render it with a client-side verdict flag.
+// Analysis must never break delivery: a failure renders the message unflagged.
+async function renderInbound(text, kind, senderAddress, allowRebuttal) {
+  let verdict = null;
+  try {
+    verdict = await analyzeMessage(text, { mode: 'offline', withFactChecks: false });
+  } catch { /* no verdict is better than no message */ }
+  const div = addMessage(text, false, kind, verdict);
+  if (allowRebuttal && verdict && (verdict.recommendation === 'caution' || verdict.recommendation === 'block') && senderAddress) {
+    attachRebuttalAction(div, text, verdict, senderAddress);
+  }
+  return div;
+}
+
+function attachRebuttalAction(div, text, verdict, senderAddress) {
+  const btn = document.createElement('button');
+  btn.textContent = '🛡️ Send rebuttal';
+  btn.className = 'ghost';
+  btn.style.cssText = 'padding:6px 12px;font-size:12px;margin-top:8px;';
+  btn.onclick = async () => {
+    if (!(await whenE2EEReady())) return;
+    btn.disabled = true;
+    try {
+      const rebuttal = await buildRebuttal(text, verdict);
+      await deliverMessage(JSON.stringify(rebuttal));
+    } catch (e) {
+      addMessage('⚠️ rebuttal failed: ' + e.message, true);
+    } finally { btn.disabled = false; }
+  };
+  div.appendChild(btn);
+}
+
+async function renderAegisPayload(payload, senderAddress) {
+  const result = await verifyRebuttal(payload, senderAddress);
+  const div = document.createElement('div');
+  div.className = 'msg rebuttal' + (result.ok ? '' : ' bad');
+  const t = document.createElement('div'); t.className = 't';
+  const m = document.createElement('div'); m.className = 'm';
+  if (result.ok) {
+    t.textContent = '🛡️ Signed rebuttal — ' + stripControls(result.statement.prebunkText);
+    m.textContent = 'verified ✓ · ' + result.did.slice(0, 16) + '…';
+    div.dataset.rebuttal = 'verified';
+  } else {
+    t.textContent = '⚠️ unverified rebuttal — ' + stripControls(payload?.statement?.prebunkText || '(no text)');
+    m.textContent = 'rejected: ' + result.reason;
+    div.dataset.rebuttal = 'unverified';
+  }
+  div.appendChild(t); div.appendChild(m);
+  appendFeedNode(div);
+}
+
+// ---- Group channels (ROADMAP §7 prototype) ----
+function subscribeGroup(groupId) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'subscribe', group: groupId }));
+}
+function resubscribeAllGroups() {
+  for (const gid of groups.keys()) subscribeGroup(gid);
+}
+function saveGroups() {
+  const data = {};
+  for (const [gid, g] of groups) data[gid] = { welcome: g.makeWelcome(), epoch: g.epoch };
+  const key = sessionStoreKey();
+  const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
+  const box = sodium.crypto_secretbox_easy(new TextEncoder().encode(JSON.stringify(data)), nonce, key);
+  localStorage.setItem(GROUPS_KEY, JSON.stringify({ v: 1, nonce: b64(nonce), box: b64(box) }));
+}
+function loadGroups() {
+  const raw = localStorage.getItem(GROUPS_KEY);
+  if (!raw) return;
+  try {
+    const { nonce, box } = JSON.parse(raw);
+    const key = sessionStoreKey();
+    const plain = sodium.crypto_secretbox_open_easy(unb64(box), unb64(nonce), key);
+    if (!plain) return; // wrong key (identity rotated) or tampered
+    const data = JSON.parse(sodium.to_string(plain));
+    for (const [gid, meta] of Object.entries(data)) {
+      let g;
+      try { g = GroupSession.fromWelcome(meta.welcome, myAddress); } catch { continue; }
+      if (g.groupId !== gid) continue;
+      groups.set(gid, g);
+    }
+    if (groups.size) renderGroupTabs();
+  } catch { /* tampered or rotated identity — start fresh */ }
+}
+function renderGroupTabs() {
+  const tabs = $('group-tabs');
+  tabs.innerHTML = '';
+  $('group-tabs-row').style.display = groups.size ? 'flex' : 'none';
+  for (const [gid] of groups) {
+    const b = document.createElement('button');
+    b.className = 'ghost';
+    b.dataset.gid = gid;
+    b.textContent = '#' + gid.slice(0, 8);
+    b.style.fontSize = '12px';
+    b.style.padding = '4px 10px';
+    b.onclick = () => switchGroup(gid);
+    tabs.appendChild(b);
+  }
+}
+function switchGroup(gid) {
+  activeGroup = gid;
+  activePeer = null; // group view: send routes to the group_id
+  $('msg-input').disabled = false;
+  $('send').disabled = false;
+  $('peer-input').value = gid;
+  [...document.querySelectorAll('#group-tabs button')].forEach((b) => {
+    b.style.borderColor = b.dataset.gid === gid ? 'var(--acc)' : '';
+  });
+}
+function showInvite(g) {
+  $('group-welcome-out').value = g.makeWelcome();
+  $('invite-row').style.display = 'flex';
+}
+function newGroup() {
+  const label = $('group-label').value.trim();
+  if (!label) { addMessage('⚠️ enter a group label first', true); return; }
+  // Optional invitee roster — only listed members can join the epoch-0 Welcome.
+  const members = $('group-members').value.split(',').map((s) => s.trim()).filter((s) => s.length === 44);
+  const g = GroupSession.create({
+    creatorAddress: myAddress,
+    label,
+    nonce: sodium.randombytes_buf(8),
+    members,
+    myAddress,
+  });
+  groups.set(g.groupId, g);
+  subscribeGroup(g.groupId);
+  saveGroups();
+  renderGroupTabs();
+  switchGroup(g.groupId);
+  showInvite(g);
+  addMessage('👥 group created — invite box holds the Welcome', true, 'group');
+  $('group-label').value = ''; $('group-members').value = '';
+}
+function joinGroup() {
+  const w = $('group-welcome').value.trim();
+  if (!w) { addMessage('⚠️ paste a Welcome JSON to join', true); return; }
+  let g;
+  try { g = GroupSession.fromWelcome(w, myAddress); }
+  catch (e) { addMessage('⚠️ ' + e.message, true); return; }
+  if (groups.has(g.groupId)) { addMessage('⚠️ already in that group', true); return; }
+  groups.set(g.groupId, g);
+  subscribeGroup(g.groupId);
+  saveGroups();
+  renderGroupTabs();
+  switchGroup(g.groupId);
+  showInvite(g);
+  $('group-welcome').value = '';
+  addMessage('👥 joined group — ' + g.groupId.slice(0, 8) + '…', true, 'group');
+}
+
 // ---- Send ----
+// The pre-send gate runs VERDAD's offline heuristics over the draft before it
+// is encrypted. A `block` is advisory, never enforced: it shows the reason and
+// asks for confirmation ("Send anyway"), matching the locks-are-advisory
+// philosophy. `deliverMessage` is the un-gated path shared by the confirmation
+// and the rebuttal flow.
 async function sendMessage() {
   const text = $('msg-input').value.trim();
-  if (!text || !activePeer) return;
+  if (!text) return;
+  // The bootstrap runs on idle time; bring it up on demand if the user acts
+  // before it has finished.
+  if (!(await whenE2EEReady())) return;
+
+  const gate = await shouldShare(text, { mode: 'offline' });
+  if (!gate.allow) {
+    // A near-share of a flagged claim is a real-world miss of the "stop" skill:
+    // the operator almost shared content the gate had to catch. Record it
+    // device-locally (append-only, never synced) so it feeds mastery/calibration.
+    // Fire-and-forget, exactly like the AEGIS modules — a dropped attempt costs
+    // one sample, a blocked send costs the message.
+    recordAttempt({
+      skillIds: ['skill.sift.stop'],
+      itemId: 'messenger.near-share',
+      correct: false,
+      context: CONTEXTS.MESSENGER,
+      heldOut: false,
+      confidence: null
+    });
+    renderGate(gate, text);
+    $('msg-input').value = '';
+    return;
+  }
+  await deliverMessage(text);
+}
+
+async function deliverMessage(text) {
+  if (!(await whenE2EEReady())) return;
+
+  // Group channel active: encrypt under the epoch key and route by group_id —
+  // the relay fans out to subscribers, no pair-session machinery involved.
+  if (activeGroup && groups.has(activeGroup)) {
+    try {
+      const g = groups.get(activeGroup);
+      const env = g.encrypt(text);
+      saveGroups(); // epoch state persisted before the send is observable
+      ws.send(JSON.stringify({ type: 'send', toPk: g.groupId, envelope: env }));
+      addMessage(text, true, 'group');
+      $('msg-input').value = '';
+    } catch (e) { addMessage('⚠️ ' + e.message, true); }
+    return;
+  }
+
+  if (!activePeer) return;
+  // Session establishment (bundle verification + ML-KEM encapsulation) is the
+  // first PQ use on the send side; fetch it now if registration has not.
+  await loadPQ();
 
   let peerPk = activePeer;
   let toAddress = peerAddresses.get(peerPk) || activeAddress || '';
@@ -253,15 +753,15 @@ async function sendMessage() {
   try {
     const env = sessions.get(peerPk).encrypt(new TextEncoder().encode(text));
     saveSessions(); // persist the ratchet state BEFORE the send is observable
-    ws.send(JSON.stringify({ type: 'send', toPk: toAddress, envelope: env, fromPk: myAddress }));
+    ws.send(JSON.stringify({ type: 'send', toPk: toAddress, envelope: env }));
     addMessage(text, true);
     $('msg-input').value = '';
   } catch (e) { addMessage('⚠️ ' + e.message, true); }
 }
 
 // ---- Receive ----
-function onMessage(msg) {
-  if (msg.type === 'directory') {
+async function onMessage(msg) {
+  if (msg.type === 'directory-shard') {
     if (pendingDirectory) {
       const p = pendingDirectory; pendingDirectory = null;
       if (msg.error) p.reject(new Error(msg.error)); else p.resolve(msg);
@@ -273,6 +773,29 @@ function onMessage(msg) {
   try { env = typeof msg.envelope === 'string' ? JSON.parse(msg.envelope) : msg.envelope; }
   catch { return; }
 
+  // Group-mode envelope (ROADMAP §7): the relay does not echo the group_id, so
+  // trial-decrypt across known groups — the epoch key authenticates and only a
+  // successful open mutates state (replay guard + commits). Self-echoes from
+  // the fan-out are dropped (already rendered on send).
+  if (env && env.mode === 'group') {
+    for (const [, g] of groups) {
+      try {
+        const r = g.handleIncoming(env);
+        if (r.commit) {
+          saveGroups();
+          addMessage('epoch advanced to ' + g.epoch, true, 'group');
+        } else if (env.sender !== myAddress) {
+          const senderAddress = env.sender || '';
+          const payload = parseAegisPayload(r.text);
+          if (payload) await renderAegisPayload(payload, senderAddress);
+          else await renderInbound(r.text, 'group', senderAddress, false);
+        }
+        return;
+      } catch { /* wrong group / malformed — try the next */ }
+    }
+    return; // not decryptable by any known group — drop silently
+  }
+
   const senderPk = env.senderDhPk;
   if (!senderPk) return;
 
@@ -281,6 +804,8 @@ function onMessage(msg) {
   try {
     if (!sessions.has(senderPk)) {
       // First contact: require a self-signed bundle that matches the sender.
+      // PQ is already loaded here: the relay only delivers to registered
+      // addresses, and registration (publishToRelay) awaits loadPQ() first.
       if (env.header?.first !== true || !env.header?.bundle) throw new Error('no bundle on first contact');
       const peer = Identity.verifyBundle(env.header.bundle);
       if (b64(peer.staticDhPk) !== senderPk || b64(peer.signPk) !== env.senderSignPk) {
@@ -310,12 +835,15 @@ function onMessage(msg) {
     // receiving chain is established even if it never replies by hand.
     if (created && senderAddress) {
       const receiptEnv = session.encrypt(new TextEncoder().encode(RECEIPT));
-      ws.send(JSON.stringify({ type: 'send', toPk: senderAddress, envelope: receiptEnv, fromPk: myAddress }));
+      ws.send(JSON.stringify({ type: 'send', toPk: senderAddress, envelope: receiptEnv }));
     }
 
     if (!isReceipt(plaintext)) {
       if (activePeer !== senderPk) setActive(senderPk, peerAddresses.get(senderPk) || '', '');
-      addMessage(plaintext, false);
+      const effectiveAddress = senderAddress || peerAddresses.get(senderPk) || '';
+      const payload = parseAegisPayload(plaintext);
+      if (payload) await renderAegisPayload(payload, effectiveAddress);
+      else await renderInbound(plaintext, 'pair', effectiveAddress, true);
     }
     saveSessions();
   } catch (e) {
@@ -325,18 +853,36 @@ function onMessage(msg) {
 }
 
 // ---- Boot ----
-async function main() {
-  sodium = await init();
-  loadOrCreateIdentity();
-  loadSessions();
-  $('my-address').textContent = myAddress;
+// The heavy E2EE bootstrap (libsodium ready-wait + WASM, identity load/keygen,
+// relay connect) is scheduled on idle time so first paint and interactivity
+// are not blocked; the send/open/copy paths await it through whenE2EEReady().
+let e2eeReady = null;
+function ensureE2EE() {
+  if (!e2eeReady) e2eeReady = main().catch((err) => { e2eeReady = null; throw err; });
+  return e2eeReady;
+}
+async function whenE2EEReady() {
+  try { await ensureE2EE(); return true; }
+  catch (err) {
+    setStatus(false, 'init failed: ' + err.message);
+    console.error(err);
+    return false;
+  }
+}
 
-  $('copy-addr').onclick = () => navigator.clipboard?.writeText(myAddress).then(() => {
-    $('copy-addr').textContent = 'Copied'; setTimeout(() => $('copy-addr').textContent = 'Copy', 1500);
-  });
+// Cheap UI wiring runs immediately; everything that needs sodium/identity
+// (address display, connect, send, copy) is gated on readiness above.
+function wireUI() {
+  $('copy-addr').onclick = async () => {
+    if (!(await whenE2EEReady())) return;
+    navigator.clipboard?.writeText(myAddress).then(() => {
+      $('copy-addr').textContent = 'Copied'; setTimeout(() => $('copy-addr').textContent = 'Copy', 1500);
+    });
+  };
   $('connect').onclick = async () => {
     const raw = $('peer-input').value.trim();
     if (!raw) return;
+    if (!(await whenE2EEReady())) return;
     // Establish lazily on send (either side may send first). For an address,
     // resolve the bundle now so we can show the active peer's key.
     if (raw.length === 44) {
@@ -357,17 +903,48 @@ async function main() {
   };
   $('send').onclick = sendMessage;
   $('msg-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
-
-  const relayParam = new URLSearchParams(location.search).get('relay');
-  const relayUrl = relayParam && /^ws:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(relayParam)
-    ? relayParam : 'ws://127.0.0.1:8080';
-  ws = new WebSocket(relayUrl);
-  ws.onopen = () => { setStatus(true, 'connected'); publishToRelay(); };
-  ws.onclose = () => setStatus(false, 'disconnected');
-  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch {} };
+  $('new-group').onclick = () => whenE2EEReady().then((ok) => ok && newGroup());
+  $('join-group').onclick = () => whenE2EEReady().then((ok) => ok && joinGroup());
 }
 
-main().catch((e) => { setStatus(false, 'init failed: ' + e.message); console.error(e); });
+async function main() {
+  sodium = await init();
+  useSodium(sodium); // group-core.js needs the same libsodium instance
+  await loadOrCreateIdentity();
+  await loadOrCreateDid(); // AEGIS attestation identity + DID binding
+  loadSessions();
+  loadGroups(); // restores epoch keys; resubscribe happens on ws.onopen
+  $('my-address').textContent = myAddress;
+
+  const relayParam = new URLSearchParams(location.search).get('relay');
+  // Relay allowlist: loopback may be ws:// or wss:// (local dev); a REMOTE relay
+  // (e.g. a Tor onion service or a public host) must be wss:// — plaintext to a
+  // remote host would expose the relay traffic to the network. Anything else
+  // falls back to the loopback dev default rather than dialling an arbitrary
+  // plaintext endpoint (fail closed).
+  const loopbackRelay = relayParam && /^wss?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(relayParam);
+  const remoteSecureRelay = relayParam && /^wss:\/\/[^/\s]+(:\d+)?(\/|$)/.test(relayParam);
+  const relayUrl = (loopbackRelay || remoteSecureRelay) ? relayParam : 'ws://127.0.0.1:8080';
+  ws = new WebSocket(relayUrl);
+  ws.onopen = async () => {
+    setStatus(true, 'connected');
+    try { await publishToRelay(); }
+    catch (err) { setStatus(false, 'PQ init failed: ' + err.message); }
+    // Group channels ride the same connection: re-bind every known group_id.
+    resubscribeAllGroups();
+  };
+  ws.onclose = () => setStatus(false, 'disconnected');
+  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)).catch(() => {}); } catch {} };
+}
+
+wireUI();
+// Defer the bootstrap to idle time; the timeout guarantees it still runs on
+// busy pages, and the send/open/copy paths await it via whenE2EEReady().
+if (typeof requestIdleCallback === 'function') {
+  requestIdleCallback(() => { ensureE2EE().catch(console.error); }, { timeout: 5000 });
+} else {
+  setTimeout(() => { ensureE2EE().catch(console.error); }, 0);
+}
 </script>
 </body>
 </html>

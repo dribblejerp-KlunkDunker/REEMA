@@ -151,7 +151,7 @@ export class GroupSession {
 
   /**
    * Build an MLS-style KeyPackage for this member (ROADMAP §7): published via
-   * the relay's `publish` verb and served back by `fetch-directory`, it is how
+   * the relay's `publish` verb and served back by `fetch-shard`, it is how
    * an existing member DISCOVERS a joinable peer (the Add half of
    * Add/Commit/Welcome). The relay stores it opaquely. `groupId`, when given,
    * is recorded as a `group_id` extension so the Add flow can verify the

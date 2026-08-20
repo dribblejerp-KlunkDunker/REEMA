@@ -6,7 +6,9 @@
  * the same core and relay the dashboard's E2EE tab uses, but through the
  * clean test client. This exercises the key-directory path (address mode +
  * one-time-prekey consumption) end to end against the actual `src/server.js`,
- * not a mock.
+ * not a mock. It also proves GroupSession channels over WebSocket: A creates
+ * a group inviting B, B joins from the Welcome, and both contexts exchange
+ * epoch-0 messages fanned out by the relay (ROADMAP §7).
  *
  * Self-contained: spawns its own relay + static server on dedicated loopback
  * ports. Skips gracefully (exit 0) when the headless browser is not resolvable
@@ -15,12 +17,12 @@
  */
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { resolveChromium } from './chromium.js';
+import { resolveChromium, launchBrowser } from './chromium.js';
 
 const RELAY_PORT = Number(process.env.M_RELAY_PORT || 7996);
 const WS_PORT = Number(process.env.M_WS_PORT || 8096);
 const UI_PORT = Number(process.env.M_UI_PORT || 8011);
-const UI_URL = `http://127.0.0.1:${UI_PORT}/messenger.html?relay=ws://127.0.0.1:${WS_PORT}`;
+const UI_URL = `http://127.0.0.1:${UI_PORT}/messenger.html?relay=wss://127.0.0.1:${WS_PORT}`;
 
 let failures = 0;
 const check = (label, cond, detail = '') => {
@@ -56,7 +58,7 @@ if (!chromium) {
 }
 
 const relay = spawn(process.execPath, ['src/server.js'], {
-  env: { ...process.env, PORT: String(RELAY_PORT), WS_PORT: String(WS_PORT), HOST: '127.0.0.1' },
+  env: { ...process.env, PORT: String(RELAY_PORT), WS_PORT: String(WS_PORT), HOST: '127.0.0.1', MIX_OFF: '1' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const ui = spawn(process.execPath, ['tools/serve.mjs'], {
@@ -74,7 +76,7 @@ try {
   await waitForTcp(RELAY_PORT, 15000);
   await waitForHttp(`http://127.0.0.1:${UI_PORT}/messenger.html`, 15000);
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser(chromium);
   const ready = (p) => p.waitForFunction(() =>
     document.getElementById('my-address').textContent.length === 44 &&
     document.getElementById('status').textContent.includes('connected'), null, { timeout: 120000 });
@@ -86,6 +88,21 @@ try {
   await A.goto(UI_URL, { timeout: 120000 }); await ready(A);
   await B.goto(UI_URL, { timeout: 120000 }); await ready(B);
   check('both messenger contexts boot and register with the relay', true);
+
+  // Deferred-bootstrap guard: the E2EE identity must NOT exist at first paint.
+  // messenger.html records FCP (paint PerformanceObserver, first-rAF fallback)
+  // and the moment identity creation completes; identity must land no earlier
+  // than first paint. An eager bootstrap would create the identity at
+  // module-eval time, well before FCP, and fail this check.
+  const timing = await A.evaluate(() => {
+    const raw = localStorage.getItem('__e2ee_timing');
+    return raw ? JSON.parse(raw) : null;
+  });
+  const probeOk = !!timing && timing.fcpMs !== null && timing.identityMs !== null;
+  check('messenger painted before the E2EE identity existed (idle-deferred bootstrap)',
+    probeOk && timing.identityMs >= timing.fcpMs,
+    probeOk ? `FCP ${timing.fcpMs.toFixed(1)}ms, identity ${timing.identityMs.toFixed(1)}ms`
+            : timing ? `probe incomplete (fcp=${timing.fcpMs}, identity=${timing.identityMs})` : 'probe missing');
 
   const addrA = await A.evaluate(() => document.getElementById('my-address').textContent);
   check('A has a 44-char bound routing address', addrA.length === 44, addrA);
@@ -105,6 +122,64 @@ try {
   await A.evaluate(() => { document.getElementById('msg-input').value = 'reply from A'; document.getElementById('send').click(); });
   await B.waitForFunction((t) => document.getElementById('feed').textContent.includes(t), 'reply from A', { timeout: 60000 });
   check('B decrypts A -> B reply (full A-B-A flow)', true);
+
+  // Hostile plaintext: B sends a message packed with ESC/OSC-8/bidi/zero-width
+  // controls. The feed must render the printable payload while stripping every
+  // control — no terminal escapes and no Trojan-Source reordering/hiding can
+  // survive into the DOM (browser twin of VULN-006).
+  const hostile = 'HOSTILE-MARKER ' + '\x1b[2J\x1b]8;;https://evil.example\x1b\\' + '\u202e\u2066\u2067\u2068\u2069\u061c\u200e\u200f';
+  await B.evaluate((h) => { document.getElementById('msg-input').value = h; document.getElementById('send').click(); }, hostile);
+  await A.waitForFunction((m) => document.getElementById('feed').textContent.includes(m), 'HOSTILE-MARKER', { timeout: 60000 });
+  check('A rendered the hostile message printable payload', true);
+  const feedText = await A.evaluate(() => document.getElementById('feed').textContent);
+  check('A feed DOM is escape-free (no ESC/OSC)', !feedText.includes('\x1b'));
+  check('A feed DOM has no C0 controls', !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(feedText));
+  check('A feed DOM resists Trojan-Source bidi/format controls', !/[\p{Cf}]/u.test(feedText));
+
+  // ---- Group channels over WebSocket (ROADMAP §7): two browser contexts
+  // join the SAME group through the real relay and exchange epoch-0 messages
+  // — the GroupSession encrypts under the shared epoch key, the relay fans the
+  // opaque envelope out to both subscribers, and each client trial-decrypts
+  // into its own GroupSession (exactly the pair flow's transport). ----
+  const addrB = await B.evaluate(() => document.getElementById('my-address').textContent);
+  check('B exposes its routing address', typeof addrB === 'string' && addrB.length === 44);
+  await A.evaluate(({ addr, label }) => {
+    document.getElementById('group-label').value = label;
+    document.getElementById('group-members').value = addr;
+    document.getElementById('new-group').click();
+  }, { addr: addrB, label: 'smoke-' + Date.now() });
+  await A.waitForFunction(() => document.getElementById('group-tabs').children.length === 1, null, { timeout: 30000 });
+  check('A created a group channel and subscribed to its group_id', true);
+  const welcome = await A.evaluate(() => document.getElementById('group-welcome-out').value);
+  const wObj = (() => { try { return JSON.parse(welcome); } catch { return null; } })();
+  check('group Welcome carries the roster (B is a member)',
+    !!(wObj && Array.isArray(wObj.members) && wObj.members.includes(addrB)));
+
+  await B.evaluate((w) => {
+    document.getElementById('group-welcome').value = w;
+    document.getElementById('join-group').click();
+  }, welcome);
+  await B.waitForFunction(() => document.getElementById('group-tabs').children.length === 1, null, { timeout: 30000 });
+  check('B joined the same group from the Welcome (membership enforced)', true);
+
+  // A sends an epoch-0 group message; the relay fans out; B renders it.
+  const gMsg = 'epoch-0 group hello ' + Date.now();
+  await A.evaluate((t) => { document.getElementById('msg-input').value = t; document.getElementById('send').click(); }, gMsg);
+  await B.waitForFunction((t) => document.getElementById('feed').textContent.includes(t), gMsg, { timeout: 60000 });
+  check('B rendered A\'s epoch-0 group message', true);
+  const bFeed = await B.evaluate(() => document.getElementById('feed').textContent);
+  check('group messages are tagged in the feed', /group · received/.test(bFeed));
+
+  // B replies into the group; A renders it (self-echo suppressed on B).
+  const gReply = 'epoch-0 group reply ' + Date.now();
+  await B.evaluate((t) => { document.getElementById('msg-input').value = t; document.getElementById('send').click(); }, gReply);
+  await A.waitForFunction((t) => document.getElementById('feed').textContent.includes(t), gReply, { timeout: 60000 });
+  check('A rendered B\'s epoch-0 group reply', true);
+  const aGroupCount = await A.evaluate(() =>
+    (document.getElementById('feed').textContent.match(/epoch-0 group hello/g) || []).length);
+  check('sender does not double-render its own group message (self-echo suppressed)',
+    aGroupCount === 1, aGroupCount + ' occurrence(s)');
+  console.log('[mark] group channels over WS verified');
 
   check('no console errors', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
 
