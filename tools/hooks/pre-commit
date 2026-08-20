@@ -1,0 +1,15 @@
+#!/bin/sh
+# Pre-commit hook: verify the STAGED content before it becomes a commit.
+#
+# The repo advances via deliberately small, selective commits (partial
+# hunks staged with `git apply --cached`, whole files whose diffs mix
+# several features). The staged blob is what gets committed — not the
+# working tree — so this hook re-checks the exact bytes in the index:
+# syntax (node --check / JSON.parse) and import resolution (relative
+# imports must be committed-or-staged; bare imports must be declared deps).
+#
+# Install (fresh clone or after a re-clone wiped .git/hooks):
+#     npm run hooks:install
+# Bypass deliberately:  git commit --no-verify
+# CI backstop:          node tools/verify-staged.mjs --all  (workflow: ci.yml)
+exec node tools/verify-staged.mjs

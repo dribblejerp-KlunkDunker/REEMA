@@ -6,6 +6,29 @@ on:
   pull_request:
 
 jobs:
+  # Staged-content verifier backstop. The local pre-commit hook (npm run
+  # hooks:install -> tools/hooks/pre-commit) runs tools/verify-staged.mjs
+  # against the staged index and aborts broken commits; this job is the
+  # enforcement point for commits made with --no-verify or on machines
+  # without the hook installed. It parse-checks every committed JS/JSON/HTML
+  # file and resolves every import against the index, so surgically-staged
+  # content that produced a broken tree fails fast — including tools/*.mjs
+  # files the test suite never executes. Runs before npm ci (no deps needed).
+  verify-content:
+    name: Verify committed content (syntax + imports)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify committed content
+        run: node tools/verify-staged.mjs --all
+
   test:
     name: Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest

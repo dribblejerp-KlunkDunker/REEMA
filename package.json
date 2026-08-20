@@ -14,7 +14,9 @@
     "test": "node src/test.js && node src/fuzz.js && node src/browser-e2e.js && node src/xss-regression.js && node src/messenger-smoke.js && node src/doc-consistency.js",
     "vendor": "node tools/vendor.mjs .",
     "serve": "node tools/serve.mjs",
-    "messenger": "node tools/messenger.mjs"
+    "messenger": "node tools/messenger.mjs",
+    "verify:staged": "node tools/verify-staged.mjs",
+    "hooks:install": "node tools/install-hooks.mjs"
   },
   "engines": {
     "node": ">=20.19.0"
