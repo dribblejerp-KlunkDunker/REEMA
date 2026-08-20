@@ -9,6 +9,8 @@
     "demo": "node src/demo.js",
     "server": "node src/server.js",
     "client": "node src/client.js",
+    "check:age": "node tools/fetch-age-cli.mjs --check",
+    "fetch:age": "node tools/fetch-age-cli.mjs",
     "test": "node src/test.js && node src/fuzz.js && node src/browser-e2e.js && node src/xss-regression.js && node src/messenger-smoke.js && node src/doc-consistency.js",
     "vendor": "node tools/vendor.mjs .",
     "serve": "node tools/serve.mjs",
