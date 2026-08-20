@@ -19,7 +19,7 @@
  * Extensible: add a regex + measurement to verify any other quoted figure.
  */
 import { readFileSync, existsSync } from 'node:fs';
-import { init, Identity, encodeBundle } from './crypto.js';
+import { init, Identity, encodeBundle, loadPQ } from './crypto.js';
 
 let failures = 0;
 const check = (label, cond, detail = '') => {
@@ -32,6 +32,7 @@ const read = (f) => readFileSync(f, 'utf8');
 
 async function main() {
   const sodium = await init();
+  await loadPQ(); // bundle measurement does keygen + self-signature
 
   // ---- 1. Shareable-bundle size ----
   console.log('=== Doc consistency: shareable-bundle size ===');

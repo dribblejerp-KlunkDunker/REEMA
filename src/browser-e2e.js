@@ -150,6 +150,38 @@ async function main() {
       page.on('requestfailed', (r) => failedRequests.push(`${tag}: ${r.url()}`));
       await page.goto(UI_URL, { timeout: 120000 });
       await waitReady(page);
+      // Deferred-bootstrap guard: the E2EE identity must NOT exist at first
+      // paint. index.html records FCP (paint PerformanceObserver, first-rAF
+      // fallback) and the moment identity creation completes; identity must
+      // land no earlier than first paint. An eager bootstrap would create the
+      // identity at module-eval time, well before FCP, and fail this check.
+      const timing = await page.evaluate(() => {
+        const raw = localStorage.getItem('__e2ee_timing');
+        return raw ? JSON.parse(raw) : null;
+      });
+      const probeOk = !!timing && timing.fcpMs !== null && timing.identityMs !== null;
+      check(`${tag}: dashboard painted before the E2EE identity existed (idle-deferred bootstrap)`,
+        probeOk && timing.identityMs >= timing.fcpMs,
+        probeOk ? `FCP ${timing.fcpMs.toFixed(1)}ms, identity ${timing.identityMs.toFixed(1)}ms`
+                : timing ? `probe incomplete (fcp=${timing.fcpMs}, identity=${timing.identityMs})` : 'probe missing');
+      // Lazy-load lock-in: the first @noble/post-quantum fetch must land at or
+      // after first paint — the modules are pulled by the deferred bootstrap's
+      // crypto work (keygen/session), never during initial module evaluation.
+      // A static @noble import would fetch before FCP and fail this.
+      const lazyOk = !!timing && timing.firstNobleMs !== null && timing.fcpMs !== null;
+      check(`${tag}: no @noble/post-quantum modules fetched during the initial page load (lazy-load win)`,
+        lazyOk && timing.firstNobleMs >= timing.fcpMs,
+        lazyOk ? `first @noble fetch ${timing.firstNobleMs.toFixed(1)}ms (FCP ${timing.fcpMs.toFixed(1)}ms)`
+               : timing ? `probe incomplete (fcp=${timing.fcpMs}, firstNoble=${timing.firstNobleMs})` : 'probe missing');
+      // Same lazy treatment for libsodium: it is injected by browser-crypto.js
+      // on the idle bootstrap, so its first fetch must also land at/after FCP.
+      // A re-added <script defer> tag would fetch it during initial load and
+      // fail this.
+      const sodiumOk = !!timing && timing.firstSodiumMs !== null && timing.fcpMs !== null;
+      check(`${tag}: vendored libsodium (WASM) is not fetched during the initial parse (lazy-load win)`,
+        sodiumOk && timing.firstSodiumMs >= timing.fcpMs,
+        sodiumOk ? `first libsodium fetch ${timing.firstSodiumMs.toFixed(1)}ms (FCP ${timing.fcpMs.toFixed(1)}ms)`
+                 : timing ? `probe incomplete (fcp=${timing.fcpMs}, firstSodium=${timing.firstSodiumMs})` : 'probe missing');
       return page;
     };
 

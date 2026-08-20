@@ -1500,7 +1500,7 @@ footer p{font-family:'Cinzel',serif;font-size:10px;letter-spacing:.3em;color:var
             <span id="relay-status" style="font-family:'Cinzel',serif;font-size:10px;color:var(--amber)">🟡 RELAY CONNECTING...</span>
             <div style="display:flex;gap:8px">
               <button type="button" class="cs-btn" onclick="shareMyKey()">🔗 SHARE KEY</button>
-              <button type="button" class="analyze-btn" onclick="generateNewE2EEIdentity()">🔄 ROTATE</button>
+              <button type="button" class="analyze-btn" onclick="rotateIdentity()">🔄 ROTATE</button>
             </div>
           </div>
         </div>
@@ -3328,11 +3328,10 @@ function exportJSONLD() {
   can serve different bytes to different visitors, which for a messaging app
   means it can serve a backdoored cipher. Regenerate with: npm run vendor
 -->
-<!-- defer: the sodium globals are only used by the E2EE module below, which
-     runs after deferred classic scripts — no parse-time dependency, so these
-     745 KB must not block parsing. -->
-<script defer src="./vendor/libsodium/libsodium.js"></script>
-<script defer src="./vendor/libsodium/libsodium-wrappers.js"></script>
+<!-- libsodium is NOT loaded here: public/browser-crypto.js injects the vendored
+     scripts on first init() (the idle-time bootstrap), so their ~192 KB brotli
+     transfer (wrapper + inline WASM) stays out of the initial parse — the same
+     deferral as the @noble/post-quantum graph. -->
 <script type="importmap">
 {
   "imports": {
@@ -3356,10 +3355,86 @@ function exportJSONLD() {
   let pendingDirectoryResolve = null; // resolver for a fetch-directory response
   const OTK_POOL_SIZE = 20;
 
+  // ---- Bootstrap timing probe (browser E2E) ----
+  // Records when the page first paints (FCP, with a first-rAF fallback) and
+  // when the E2EE identity first exists, so src/browser-e2e.js can assert the
+  // idle-deferred bootstrap never blocks first paint: identity creation must
+  // not precede first paint. The values are mirrored to localStorage because
+  // the E2E's page.evaluate runs in an isolated world — same-origin storage
+  // is shared, the window global is not. Harmless in production; if the probe
+  // is ever removed, the E2E check fails loudly.
+  window.__e2eeBootstrapTiming = { fcpMs: null, identityMs: null, firstNobleMs: null, firstSodiumMs: null };
+  const storeTiming = () => {
+    try { localStorage.setItem('__e2ee_timing', JSON.stringify(window.__e2eeBootstrapTiming)); } catch { /* private mode */ }
+  };
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        if (entry.name === 'first-contentful-paint' && window.__e2eeBootstrapTiming.fcpMs === null) {
+          window.__e2eeBootstrapTiming.fcpMs = entry.startTime;
+          storeTiming();
+        }
+      }
+    }).observe({ type: 'paint', buffered: true });
+  } catch { /* engines without PerformanceObserver: fall back to first rAF */ }
+  // Lazy-load lock-in: record when the FIRST @noble/post-quantum module and
+  // the FIRST vendored libsodium script are fetched (resource timing covers
+  // cache hits too, so a browser-cached fetch still counts). If a static
+  // import or <script> tag ever re-enters the initial page, the fetch would
+  // start at module-eval — before first paint — and the browser E2E fails.
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const t = window.__e2eeBootstrapTiming;
+        if (entry.name.includes('/@noble/') && t.firstNobleMs === null) {
+          t.firstNobleMs = entry.startTime;
+          storeTiming();
+        } else if (entry.name.includes('/libsodium/') && t.firstSodiumMs === null) {
+          t.firstSodiumMs = entry.startTime;
+          storeTiming();
+        }
+      }
+    }).observe({ type: 'resource', buffered: true });
+  } catch { /* no resource timing: markers stay null and the E2E fails loudly */ }
+  if (window.__e2eeBootstrapTiming.fcpMs === null) {
+    const markPaint = () => {
+      if (window.__e2eeBootstrapTiming.fcpMs === null) {
+        window.__e2eeBootstrapTiming.fcpMs = performance.now();
+        storeTiming();
+      }
+    };
+    requestAnimationFrame(markPaint);
+    addEventListener('load', markPaint);
+  }
+  const markIdentityExists = () => {
+    if (window.__e2eeBootstrapTiming.identityMs === null) {
+      window.__e2eeBootstrapTiming.identityMs = performance.now();
+      storeTiming();
+    }
+  };
+
   // Multi-session state
   // sessions: Map<peerPkB64, { session: Session, messages: number, epoch: number, lastEnvSize: number }>
   const sessions = new Map();
   let activePeerPk = null; // currently viewed session's peer pk
+
+  // ---- Deferred E2EE bootstrap ----
+  // startE2EE() is expensive (libsodium ready-wait, ML-KEM/ML-DSA keygen,
+  // relay connect), so it is scheduled on requestIdleCallback and the
+  // send/open paths await it instead of blocking first paint.
+  let e2eeReady = null;
+  function ensureE2EE() {
+    if (!e2eeReady) e2eeReady = startE2EE().catch((err) => { e2eeReady = null; throw err; });
+    return e2eeReady;
+  }
+  async function whenE2EEReady() {
+    try { await ensureE2EE(); return true; }
+    catch (err) {
+      console.error('[E2EE] bootstrap failed:', err);
+      showToast('⚠️ Crypto bootstrap failed — ' + err.message);
+      return false;
+    }
+  }
 
   // ---- Identity management ----
 
@@ -3415,14 +3490,45 @@ function exportJSONLD() {
     myPk = sodium.to_base64(myId.pk, sodium.base64_variants.ORIGINAL);
     myAddress = sodium.to_base64(Identity.deriveAddress(myId.signPk, myId.pk), sodium.base64_variants.ORIGINAL);
     updateUIWithKeys();
+    markIdentityExists();
   }
 
 
   // Authenticated registration: publish the identity-bound address, the
   // self-signed bundle (proof-of-possession) and the one-time prekey pool.
+  // The shareable prekey bundle is static per identity (public key material
+  // plus a self-signature over it), so it is cached in localStorage after the
+  // first publish. Re-publishing a returning user's cached bundle needs no
+  // ML-DSA-65 — the only PQ need in the registration path — which keeps the
+  // @noble/post-quantum graph unfetched on reload until a session is actually
+  // established. A rotated or vault-imported identity has a different
+  // staticDhPk, so the cache naturally misses and re-signs.
+  function myCachedBundle() {
+    const b = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
+    const cached = localStorage.getItem('e2ee_bundle_v6');
+    if (cached) {
+      try {
+        const bundle = JSON.parse(cached);
+        if (bundle && bundle.v === 6 && bundle.staticDhPk === b(myId.pk)) return bundle;
+      } catch { /* corrupted cache — rebuild */ }
+    }
+    return null;
+  }
+  function buildCachedBundle() {
+    const bundle = myId.makeBundle();
+    localStorage.setItem('e2ee_bundle_v6', JSON.stringify(bundle));
+    return bundle;
+  }
+
   async function publishToRelay() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    await loadPQ(); // makeBundle self-signs the bundle with ML-DSA-65
+    let bundle = myCachedBundle();
+    if (!bundle) {
+      // Fresh or rotated identity: self-sign the bundle now (PQ was already
+      // loaded by keygen). Returning users skip this entirely.
+      await loadPQ();
+      bundle = buildCachedBundle();
+    }
     const b = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
     const otks = [...myId.oneTimePrekeys.values()].map((kp) => ({
       id: kp.id, dhPk: b(kp.pk), signature: b(kp.signature),
@@ -3447,6 +3553,7 @@ function exportJSONLD() {
     myId = new Identity();
     myId.newOneTimePrekeys(OTK_POOL_SIZE);
     persistIdentity();
+    markIdentityExists();
     myPk = sodium.to_base64(myId.pk, sodium.base64_variants.ORIGINAL);
     myAddress = sodium.to_base64(Identity.deriveAddress(myId.signPk, myId.pk), sodium.base64_variants.ORIGINAL);
     updateUIWithKeys();
@@ -3476,13 +3583,24 @@ function exportJSONLD() {
 
   // ---- Share Key ----
 
-  window.shareMyKey = function() {
+  window.shareMyKey = async function() {
+    if (!(await whenE2EEReady())) return;
+    await loadPQ(); // makeBundle self-signs with ML-DSA-65
     // v5: the shareable identity is the self-signed prekey bundle, not a bare
     // X25519 key — it carries everything a peer needs to establish a session.
     const shareUrl = `${location.origin}${location.pathname}#bundle=${encodeURIComponent(encodeBundle(myId.makeBundle()))}`;
     navigator.clipboard.writeText(shareUrl).then(() => {
       showToast('🔗 Share link copied! Send it to your peer — they will auto-connect on open.');
     });
+  };
+
+  // ROTATE is gated separately: generateNewE2EEIdentity() is also called by
+  // the deferred bootstrap itself, so the button routes through this wrapper
+  // to await readiness first (gating the bare function would deadlock it on
+  // its own bootstrap).
+  window.rotateIdentity = async function() {
+    if (!(await whenE2EEReady())) return;
+    await generateNewE2EEIdentity();
   };
 
   // ---- Vault at rest (age format) ----
@@ -3518,6 +3636,7 @@ function exportJSONLD() {
   };
 
   window.vaultExport = async function() {
+    if (!(await whenE2EEReady())) return;
     const passphrase = document.getElementById('vault-passphrase').value;
     if (!vaultIdentity && !passphrase) {
       showToast('Generate an age keypair or set a passphrase first');
@@ -3560,6 +3679,7 @@ function exportJSONLD() {
   };
 
   window.vaultImport = async function() {
+    if (!(await whenE2EEReady())) return;
     const armored = document.getElementById('vault-import-in').value.trim();
     if (!armored) { showToast('Paste an armored age vault first'); return; }
     const key = document.getElementById('vault-import-key').value.trim();
@@ -4058,6 +4178,9 @@ function exportJSONLD() {
       const raw = document.getElementById('peer-key-input').value.trim();
       const text = document.getElementById('chat-input').value.trim();
       if (!raw || !text) { showToast('Enter a peer bundle or address and a message.'); return; }
+      // The bootstrap runs on idle time; bring it up on demand if the user
+      // acts before it has finished.
+      if (!(await whenE2EEReady())) return;
       await loadPQ(); // session establish/encrypt needs ML-KEM-768
 
       let peer;
@@ -4126,6 +4249,14 @@ function exportJSONLD() {
     });
   }
 
-  startE2EE().catch(console.error);
+  // Defer the expensive E2EE bootstrap (libsodium ready-wait + keygen + relay
+  // connect) to idle time so first paint and interactivity are not blocked.
+  // The timeout guarantees it still runs on busy pages; send/open await it
+  // through whenE2EEReady() anyway.
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(() => { ensureE2EE().catch(console.error); }, { timeout: 5000 });
+  } else {
+    setTimeout(() => { ensureE2EE().catch(console.error); }, 0);
+  }
 </script>
 </body>

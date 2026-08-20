@@ -1,4 +1,4 @@
-import { init, Identity, Session, signingPayload } from './crypto.js';
+import { init, Identity, Session, signingPayload, loadPQ } from './crypto.js';
 
 /**
  * Mutation fuzzer for the Double Ratchet state machine.
@@ -56,6 +56,7 @@ const clone = (env) => JSON.parse(JSON.stringify(env));
 
 async function main() {
   const sodium = await init();
+  await loadPQ(); // every Identity/Session op needs ML-KEM/ML-DSA
   const rnd = mulberry32(0xC0FFEE);
   const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
   const unb64 = (s) => sodium.from_base64(s, sodium.base64_variants.ORIGINAL);

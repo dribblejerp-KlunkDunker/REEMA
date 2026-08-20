@@ -66,12 +66,39 @@ export async function createTorSocket(host, port, { useTor = true, allowDirectFa
   }
 }
 
-/** True if a Tor SOCKS proxy appears to be running locally. */
-export async function isTorAvailable() {
+/**
+ * True if a Tor SOCKS proxy appears to be listening. Optional `{ host, port }`
+ * override for tests that want to probe a specific (possibly dead) endpoint.
+ */
+export async function isTorAvailable({ host = TOR_PROXY.host, port = TOR_PROXY.port } = {}) {
   const net = await import('node:net');
   return new Promise((resolve) => {
-    const socket = net.connect(TOR_PROXY.port, TOR_PROXY.host);
+    const socket = net.connect(port, host);
     socket.once('connect', () => { socket.destroy(); resolve(true); });
     socket.once('error', () => resolve(false));
   });
+}
+
+/**
+ * Resolve the Tor SOCKS5 proxy config for a BROWSER shell, failing closed.
+ *
+ * The browser cannot do per-connection SOCKS the way src/client.js does
+ * (WebSocket in the page has no such hook), so the equivalent of the CLI's Tor
+ * path is to launch the browser itself with `--proxy-server=socks5://…`. This
+ * returns that config only when Tor is actually reachable; otherwise it throws
+ * rather than letting the launcher silently open a direct (IP-exposing)
+ * connection. A browser that believes it is anonymous is more dangerous than
+ * one that refuses to start.
+ *
+ * @returns {Promise<{ server: string, host: string, port: number }>}
+ */
+export async function resolveTorProxy({ host = TOR_PROXY.host, port = TOR_PROXY.port } = {}) {
+  const up = await isTorAvailable({ host, port });
+  if (!up) {
+    throw new Error(
+      `Tor SOCKS proxy at ${host}:${port} is not reachable — refusing to launch (fail closed).\n` +
+      `Start Tor (or set TOR_HOST/TOR_PORT), or run tools/messenger.mjs for the direct local demo.`
+    );
+  }
+  return { server: `socks5://${host}:${port}`, host, port };
 }

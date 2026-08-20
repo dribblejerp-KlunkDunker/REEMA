@@ -54,7 +54,14 @@ function writeKeyfile(sodium, id) {
   const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
   const otks = {};
   for (const [otkId, kp] of id.oneTimePrekeys || []) {
-    otks[otkId] = { dhSk: b64(kp.sk), dhPk: b64(kp.pk) };
+    // v6: the OTK signature MUST persist too — the relay verifies every
+    // one-time prekey on publish, so a reloaded pool without signatures is
+    // unpublishable. (null signatures are omitted, triggering regeneration.)
+    otks[otkId] = {
+      dhSk: b64(kp.sk),
+      dhPk: b64(kp.pk),
+      signature: kp.signature ? b64(kp.signature) : undefined,
+    };
   }
   writeFileSync(
     KEYFILE,
@@ -124,11 +131,25 @@ export function loadOrCreateIdentity(sodium) {
   if (data && data.oneTimePrekeys && typeof data.oneTimePrekeys === 'object') {
     const otks = new Map();
     for (const [otkId, kp] of Object.entries(data.oneTimePrekeys)) {
-      otks.set(Number(otkId), { sk: unb64(kp.dhSk), pk: unb64(kp.dhPk) });
+      const nid = Number(otkId);
+      otks.set(nid, {
+        // The id must live on the value too: the publish path serializes
+        // kp.id and the relay rejects OTKs without an integer id.
+        id: nid,
+        sk: unb64(kp.dhSk),
+        pk: unb64(kp.dhPk),
+        signature: kp.signature ? unb64(kp.signature) : null,
+      });
     }
     id.oneTimePrekeys = otks;
   }
-  if (id.oneTimePrekeys.size < OTK_POOL_SIZE) {
+  // A pool is only publishable if every OTK carries its signature (the relay
+  // verifies each one on publish). Older keyfiles dropped signatures on
+  // persist; detect that and regenerate the whole pool — the relay replaces
+  // the pool wholesale on re-publish, so this is safe and self-healing.
+  if (id.oneTimePrekeys.size < OTK_POOL_SIZE
+      || [...id.oneTimePrekeys.values()].some((kp) => !kp.signature)) {
+    id.oneTimePrekeys = new Map();
     id.newOneTimePrekeys(OTK_POOL_SIZE);
     writeKeyfile(sodium, id);
   }

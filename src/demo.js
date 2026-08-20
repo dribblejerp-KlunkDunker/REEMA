@@ -1,4 +1,4 @@
-import { init, Identity, Session, signingPayload, encodeBundle, RECEIPT, isReceipt } from './crypto.js';
+import { init, Identity, Session, signingPayload, encodeBundle, loadPQ, RECEIPT, isReceipt } from './crypto.js';
 
 const _utf8 = (s) => new TextEncoder().encode(s);
 
@@ -10,6 +10,7 @@ function assert(label, condition) {
 
 async function main() {
   const sodium = await init();
+  await loadPQ(); // keygen + bundle sign/verify + every session op need ML-KEM/ML-DSA
 
   console.log('=== Protocol v6: Post-Quantum Hybrid Double Ratchet ===\n');
   console.log('  Confidentiality : X25519 + ML-KEM-768 (FIPS 203)');

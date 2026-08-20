@@ -1,4 +1,4 @@
-import { Identity, Session, signingPayload, encodeBundle, decodeBundle, useSodium, loadPQ, RECEIPT, isReceipt } from './crypto-core.js';
+import { Identity, Session, signingPayload, encodeBundle, decodeBundle, useSodium, loadPQ, RECEIPT, isReceipt, directoryShard, selectOneTimePrekey } from './crypto-core.js';
 
 /**
  * Browser adapter for the shared post-quantum hybrid Double Ratchet core
@@ -59,4 +59,4 @@ export async function init() {
   return sodium;
 }
 
-export { Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, RECEIPT, isReceipt };
+export { Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, RECEIPT, isReceipt, directoryShard, selectOneTimePrekey };

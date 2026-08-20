@@ -63,3 +63,22 @@ export function resolveChromium() {
   console.log('::notice::browser driver: none (browser stages will skip)');
   return null;
 }
+
+/**
+ * Launch the resolved driver for the browser E2E stages.
+ *
+ * The relay is now TLS-on by default and presents the committed self-signed dev
+ * cert (tools/certs/dev-cert.pem), so headless Chromium must not reject that
+ * certificate when a page opens a `wss://` relay connection. The fingerprint
+ * pinning that protects real clients lives in src/tls.js (Node) — the browser
+ * can't do TOFU fingerprint pinning on a raw WebSocket, so the harness trusts
+ * the loopback dev cert by ignoring certificate errors instead. This is the
+ * test-harness analogue of "pin the dev cert", scoped to the headless driver.
+ */
+export function launchBrowser(chromium, opts = {}) {
+  return chromium.launch({
+    headless: opts.headless ?? true,
+    args: ['--ignore-certificate-errors', ...(opts.args || [])],
+    ...(opts.proxy ? { proxy: opts.proxy } : {}),
+  });
+}

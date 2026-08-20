@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const _sodium = require('libsodium-wrappers');
 
-import { Identity, Session, signingPayload, encodeBundle, decodeBundle, useSodium, loadPQ, RECEIPT, isReceipt } from '../public/crypto-core.js';
+import { Identity, Session, signingPayload, encodeBundle, decodeBundle, useSodium, loadPQ, pqLoaded, RECEIPT, isReceipt, directoryShard, selectOneTimePrekey } from '../public/crypto-core.js';
 
 /**
  * Node adapter for the shared post-quantum hybrid Double Ratchet core
@@ -26,4 +26,4 @@ export async function init() {
   return sodium;
 }
 
-export { Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, RECEIPT, isReceipt };
+export { Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, pqLoaded, RECEIPT, isReceipt, directoryShard, selectOneTimePrekey };

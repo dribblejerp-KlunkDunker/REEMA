@@ -1,4 +1,4 @@
-import { init, encodeBundle, Identity } from './crypto.js';
+import { init, encodeBundle, Identity, loadPQ } from './crypto.js';
 import { loadOrCreateIdentity, KEYFILE } from './identity.js';
 import { generateVaultIdentity, exportVault, importVault } from './vault.js';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -32,6 +32,7 @@ async function main() {
   }
 
   const sodium = await init();
+  await loadPQ(); // keygen + bundle signing need ML-KEM/ML-DSA (vault-* needs neither)
   const b64 = (u) => sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
 
   const id = loadOrCreateIdentity(sodium);

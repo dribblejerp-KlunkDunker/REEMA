@@ -65,6 +65,16 @@ export function loadPQ() {
 }
 
 /**
+ * Whether the post-quantum graph (ML-KEM-768 / ML-DSA-65) has finished
+ * loading via loadPQ(). The relay uses this to prove server-side deferral:
+ * before the first publish arrives this must be false — i.e. zero
+ * @noble/post-quantum modules have been loaded.
+ */
+export function pqLoaded() {
+  return ml_kem768 !== null && ml_dsa65 !== null;
+}
+
+/**
  * Fail loudly if the PQ graph is not loaded yet. Every method that touches
  * ml_kem768 / ml_dsa65 calls this first, so a consumer that skipped
  * `await loadPQ()` gets a descriptive error instead of a null dereference.
@@ -275,6 +285,46 @@ function toB64(u) { return sodium.to_base64(u, sodium.base64_variants.ORIGINAL);
 function fromB64(s) { return sodium.from_base64(s, sodium.base64_variants.ORIGINAL); }
 
 /**
+ * The directory-shard id for a routing address (ANONYMITY.md Phase 1, private
+ * directory lookup): the first `shardBytes` bytes of the 32-byte address,
+ * re-encoded. Both the relay and the client compute this identically, so a
+ * `fetch-shard {shard}` request names a whole bucket — never one address — and
+ * k-anonymity equals the shard's population.
+ * @param {string} addressB64 — 44-char base64 routing address
+ * @param {number} shardBytes — prefix length in bytes (default 1 → 256 shards)
+ * @returns {string} base64 shard id
+ */
+export function directoryShard(addressB64, shardBytes = 1) {
+  const raw = fromB64(addressB64);
+  if (!Number.isInteger(shardBytes) || shardBytes < 1 || shardBytes > raw.length) {
+    throw new Error('invalid directory shard size');
+  }
+  return toB64(raw.slice(0, shardBytes));
+}
+
+/**
+ * Pick a one-time prekey from a shard-served pool, deterministically per
+ * (sender, recipient). With whole-shard fetch the relay no longer consumes the
+ * prekey server-side (it cannot know WHICH entry was wanted), so two distinct
+ * senders could otherwise both pick the same prekey and the second's first
+ * message would be dropped after the recipient burns the prekey. Deriving the
+ * index from the sender's own address makes distinct senders pick distinct
+ * prekeys (barring pool exhaustion or a hash collision), so single-use is
+ * enforced recipient-side without a server-side consume.
+ * @returns {object|null} the selected `{ id, dhPk, signature }`, or null if empty
+ */
+export function selectOneTimePrekey(senderAddressB64, recipientAddressB64, pool) {
+  if (!Array.isArray(pool) || pool.length === 0) return null;
+  const sorted = [...pool].sort((a, b) => a.id - b.id);
+  const msg = new TextEncoder().encode(
+    'reema-otk-select-v1\u0000' + senderAddressB64 + '\u0000' + recipientAddressB64
+  );
+  const h = sodium.crypto_generichash(32, msg);
+  const idx = (h[0] * 256 + h[1]) % sorted.length;
+  return sorted[idx];
+}
+
+/**
  * Encode a prekey bundle as a compact shareable string (base64 of the JSON).
  * This is the v5 replacement for the raw 32-byte X25519 key that v4
  * distributed: it carries the static DH key, signing key, signed prekey and
@@ -310,6 +360,9 @@ function concatBytes(parts) {
 /** Domain separator for one-time-prekey signatures (distinct from the bundle). */
 const OTK_DOMAIN = new TextEncoder().encode('aegis-otk-v6');
 
+/** Domain separator for the per-session delivery token (sealed sender). */
+const TOKEN_DOMAIN = new TextEncoder().encode('aegis-session-token-v1');
+
 /** Canonical encoding of a one-time prekey the signature covers. */
 function otkPayload(id, dhPk) {
   return concatBytes([OTK_DOMAIN, u32be(id), u32be(dhPk.length), dhPk]);
@@ -324,6 +377,22 @@ function bundlePayload(staticDhPk, signPk, signedDhPk, kemPk) {
     u32be(signedDhPk.length), signedDhPk,
     u32be(kemPk.length), kemPk,
   ]);
+}
+
+/**
+ * Per-session delivery token (ANONYMITY.md Phase 1, sealed sender): a 32-byte
+ * opaque id derived from the bootstrap DH secrets that ONLY the two peers can
+ * compute. It is identical on both sides (replies need no negotiation round
+ * trip), is never an address, and — because it mixes in the one-time prekey
+ * when one is used — rotates per session. When the OTK pool is exhausted it
+ * degrades to a per-identity-pair constant (the honest limit stated in
+ * DESIGN-sealed-sender.md). The token is carried on the envelope so a recipient
+ * can dispatch to the right session BEFORE decrypting; it is deliberately NOT
+ * covered by the envelope signature (a relay could swap it to force a drop,
+ * never a wrong-session decrypt).
+ */
+function deriveDeliveryToken(static_ss, signed_ss, otk_ss = new Uint8Array(0)) {
+  return sodium.crypto_generichash(32, concatBytes([TOKEN_DOMAIN, static_ss, signed_ss, otk_ss]));
 }
 
 // ---- Double Ratchet KDFs ----
@@ -403,8 +472,8 @@ export class Session {
     //     by the sender (header.otk_id); DH3 = DH(otkSk, peer.staticPk).
     // Either way the same shared secret is mixed into the root.
     this.peerOneTimePrekeyId = null;
+    let otk_ss = new Uint8Array(0);
     if (peerOneTimePrekey) {
-      let otk_ss;
       if (peerOneTimePrekey.sk) {
         otk_ss = sodium.crypto_box_beforenm(peer.staticDhPk, peerOneTimePrekey.sk);
       } else {
@@ -417,6 +486,10 @@ export class Session {
       this.peerOneTimePrekeyId = peerOneTimePrekey.id;
     }
     this.RK = root;
+    // Sealed-sender delivery token: derived from the bootstrap secrets, so it
+    // is identical on both sides and opaque to the relay (which never sees
+    // these secrets). See deriveDeliveryToken().
+    this.deliveryToken = deriveDeliveryToken(static_ss, signed_ss, otk_ss);
 
     this._firstBuilt = false; // true once a first message has been built (crash recovery)
 
@@ -537,6 +610,7 @@ export class Session {
     const envelope = {
       v: 6,
       senderDhPk: toB64(this.identity.pk),
+      deliveryToken: toB64(this.deliveryToken),
       header,
       nonce: toB64(nonce),
       ciphertext: toB64(ciphertext),
@@ -846,6 +920,7 @@ export class Session {
       peerSignPk: b64(this.peerSignPk),
       peerSignedDhPk: b64(this.peerSignedDhPk),
       peerKemPk: b64(this.peerKemPk),
+      deliveryToken: b64(this.deliveryToken),
       RK: b64(this.RK),
       DHs: this.DHs ? { sk: b64(this.DHs.sk), pk: b64(this.DHs.pk) } : null,
       DHr: b64or(this.DHr),
@@ -882,6 +957,16 @@ export class Session {
     s.peerSignPk = unb64(data.peerSignPk);
     s.peerSignedDhPk = unb64(data.peerSignedDhPk);
     s.peerKemPk = unb64(data.peerKemPk);
+    // Sessions persisted before sealed sender have no token; re-derive it from
+    // the static + signed DH secrets (the one-time prekey secret is gone, so
+    // this token may differ from the peer's — dispatch falls back to
+    // senderDhPk in that rare migration case).
+    s.deliveryToken = data.deliveryToken
+      ? unb64(data.deliveryToken)
+      : deriveDeliveryToken(
+          identity.sharedSecret(s.peerDhPk),
+          identity.signedSharedSecret(s.peerSignedDhPk),
+        );
     s.RK = unb64(data.RK);
     s.DHs = data.DHs ? { sk: unb64(data.DHs.sk), pk: unb64(data.DHs.pk) } : null;
     s.DHr = unb64or(data.DHr);

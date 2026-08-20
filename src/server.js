@@ -1,7 +1,13 @@
 import { createServer } from 'node:net';
+import tls from 'node:tls';
+import http from 'node:http';
+import https from 'node:https';
+import { readFileSync, existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
-import { init, Identity, loadPQ } from './crypto.js';
-import { stripControls, shortKey } from './sanitize.js';
+import { init, Identity, loadPQ, pqLoaded, directoryShard } from './crypto.js';
+import { stripControls, shortKey, sanitizedLogger } from './sanitize.js';
 
 /**
  * Ciphertext-only relay + key directory (protocol v6).
@@ -23,9 +29,10 @@ import { stripControls, shortKey } from './sanitize.js';
  * signing key). The relay verifies public key material only — never private
  * keys or plaintext.
  *
- * The directory also holds one-time prekeys, handed out one per fetch and
- * consumed server-side, so each new session bootstrap gets its own forward
- * secrecy. An exhausted pool degrades to a prekey-less bootstrap.
+ * The directory also holds one-time prekeys, served INSIDE a whole shard and
+ * burned by the recipient on first receive — single-use is enforced client-side,
+ * because the relay cannot know which entry a shard requester actually wanted.
+ * An exhausted pool degrades to a prekey-less bootstrap.
  *
  * Group mode (prototype — ROADMAP §7): the relay also carries OPAQUE
  * group-mode envelopes ({ v: 6, mode: 'group', ciphertext }) to opaque
@@ -35,6 +42,23 @@ import { stripControls, shortKey } from './sanitize.js';
  * registered address and simply also listen on group ids, so authenticated
  * registration is untouched.
  */
+
+// --sanitize-log mode (or RELAY_SANITIZE_LOG=1): sink-level last line of
+// defense. Every field the relay echoes is already routed through short()/
+// stripControls() at the call site, but this additionally wraps console.log/
+// console.error/console.warn so EVERY line the relay writes passes through
+// stripControls() — a future code path that forgets the per-field discipline
+// still cannot emit a control character. Installed before anything can log.
+const SANITIZE_LOG =
+  process.argv.includes('--sanitize-log')
+  || process.env.RELAY_SANITIZE_LOG === '1'
+  || process.env.RELAY_SANITIZE_LOG === 'true';
+if (SANITIZE_LOG) {
+  const safe = sanitizedLogger();
+  console.log = safe.log;
+  console.error = safe.error;
+  console.warn = safe.warn;
+}
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 7980);
@@ -46,8 +70,23 @@ const WS_PORT = Number(process.env.WS_PORT || 8080);
 const MAX_LINE_BYTES = 256 * 1024;
 const MAX_QUEUE_PER_RECIPIENT = 100;
 const MAX_QUEUED_RECIPIENTS = 10_000;
-const QUEUE_TTL_MS = 24 * 60 * 60 * 1000;
+// How long an undelivered message is retained before it self-destructs
+// (ANONYMITY.md §3.6: metadata lives in YOUR storage only as long as needed).
+// Configurable so an operator can run an ephemeral relay; 24h default is
+// store-and-forward.
+const QUEUE_TTL_MS = Number(process.env.QUEUE_TTL_MS) > 0
+  ? Number(process.env.QUEUE_TTL_MS)
+  : 24 * 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+// Zero-retention mode (ANONYMITY.md §3.6): RELAY_EPHEMERAL=1 disables
+// store-and-forward entirely — the relay NEVER queues. A message to an offline
+// recipient is dropped at acceptance, so no copy exists for an adversary to
+// seize later: once delivered (or dropped), nothing survives the moment.
+const EPHEMERAL = process.env.RELAY_EPHEMERAL === '1' || process.env.RELAY_EPHEMERAL === 'true';
+// Identity-bearing log lines are OFF by default: the relay must not accumulate
+// a who→whom record in its operator logs. RELAY_VERBOSE=1 re-enables them for
+// debugging; src/test.js runs verbose so those lines stay proven control-free.
+const VERBOSE = process.env.RELAY_VERBOSE === '1';
 
 // Deliveries are padded to a fixed bucket so a network observer cannot read
 // the plaintext length off the ciphertext size. Plaintext padding (256-byte
@@ -60,8 +99,36 @@ const DELIVERY_PAD_BUCKET = 12 * 1024;
 // Welcome (which embeds the ratchet tree) — while staying well inside
 // MAX_LINE_BYTES after base64 inflation (128 KB * 4/3 ≈ 171 KB).
 const MAX_GROUP_ENVELOPE_BYTES = 128 * 1024;
+// Private directory lookup (ANONYMITY.md Phase 1): the directory is sharded by
+// a fixed prefix of the routing address. A requester fetches a WHOLE shard, so
+// the relay learns "fetched shard #k" — never "looked up address X".
+// k-anonymity = shard population; raise this to shrink shards (more buckets,
+// less anonymity per fetch), lower it (1 byte = 256 buckets) for bigger shards.
+const DIR_SHARD_BYTES = Math.max(1, Number(process.env.DIR_SHARD_BYTES) || 1);
 
-// recipientPk -> array of { envelope, fromPk, ts }
+// ---- Relay-side message mixing (ROADMAP §8) ----
+// A fixed-cadence mix window. Every message accepted for relay enters a pool,
+// and a ticker closes the window once per MIX_WINDOW_MS, delivering the whole
+// window's traffic as ONE batch (crypto-shuffled order). Batching breaks the
+// send-time -> deliver-time correlation a passive observer could otherwise read
+// off the relay; the existing fixed-size padding already hid *size*. This is
+// NOT a mixnet — at low traffic the anonymity set is one message — but it is
+// the cheap, relay-only win ROADMAP §8 describes.
+//
+// Opt out with MIX_OFF=1 (or MIX_WINDOW_MS=0): the deterministic test suites
+// and latency-sensitive flows run with it off, so delivery stays immediate.
+const MIX_OFF = process.env.MIX_OFF === '1' || process.env.MIX_OFF === 'true'
+  || process.env.MIX_WINDOW_MS === '0';
+const MIX_WINDOW_MS = MIX_OFF ? 0 : Math.max(1, Number(process.env.MIX_WINDOW_MS) || 1000);
+// Optional intra-batch jitter (ms): randomise each PAIR delivery's moment within
+// the batch (0..MIX_JITTER_MS) so per-recipient arrival order does not leak.
+// Group fan-out stays identical-time regardless (maximises sender hiding within
+// the batch). Default 0 keeps the batching regression deterministic.
+const MIX_JITTER_MS = MIX_OFF ? 0 : Math.max(0, Number(process.env.MIX_JITTER_MS) || 0);
+
+// recipientPk -> array of { envelope, ts }. Sealed sender (ANONYMITY.md Phase 1):
+// there is deliberately NO sender field here — the relay never learns who sent
+// a message, only where it is going and an opaque envelope.
 const inbox = new Map();
 // recipientPk -> { type: 'tcp'|'ws', raw: socket }
 const online = new Map();
@@ -74,7 +141,20 @@ const directory = new Map();
 // to that id. Members register their own address as usual AND subscribe to
 // group ids, so group fan-out never touches the address/directory machinery.
 const groups = new Map();
+// The mix pool: everything accepted for relay since the last window close.
+// Each item keeps its original receipt ts so the TTL sweep can still expire it
+// (mixing must never resurrect a message past its TTL) and an optional directTo
+// client used by the subscribe-backlog flush.
+const mixPool = []; // { recipient, envelope, ts, directTo|null }
+// Timer for the current mix window (see scheduleMixFlush). null when idle.
+let mixTimer = null;
+// Aggregate count of discarded cover frames (never queued, never delivered).
+let coverDiscarded = 0;
+// Aggregate count of relayed messages. Kept instead of a per-recipient log line:
+// the relay must not accumulate a who→whom record in its own operator logs.
+let relayedCount = 0;
 let sodium = null; // bound by init() before the servers listen
+let pqLoadedReported = false; // one-shot deferral report, emitted at the first publish
 
 // Sanitize control characters and homoglyph lookalikes before echoing a
 // key/address into the operator's console. The `send` path accepts an
@@ -114,7 +194,14 @@ function sendPadded(client, obj) {
   else client.raw.write(line);
 }
 
-function queueMessage(toPk, envelope, fromPk) {
+function queueMessage(toPk, envelope, ts = Date.now()) {
+  // Single queueing choke point. In ephemeral mode nothing is ever stored, so
+  // every "would queue" path (offline pair, offline group, backlog flush)
+  // degrades to a drop. Guarding here — not at each call site — means no code
+  // path can accidentally retain a copy.
+  if (EPHEMERAL) {
+    return { ok: false, error: 'recipient offline — ephemeral relay stores nothing' };
+  }
   const list = inbox.get(toPk) || [];
   if (list.length >= MAX_QUEUE_PER_RECIPIENT) {
     return { ok: false, error: 'recipient queue full' };
@@ -122,9 +209,122 @@ function queueMessage(toPk, envelope, fromPk) {
   if (!inbox.has(toPk) && inbox.size >= MAX_QUEUED_RECIPIENTS) {
     return { ok: false, error: 'relay queue capacity reached' };
   }
-  list.push({ envelope, fromPk, ts: Date.now() });
+  list.push({ envelope, ts });
   inbox.set(toPk, list);
   return { ok: true };
+}
+
+// Uniform-random shuffle source: prefer libsodium's RNG (bound at startup) so
+// the batch order is not predictable from Math.random(), and fall back only if
+// sodium is somehow unavailable.
+function randomBelow(n) {
+  if (sodium && typeof sodium.randombytes_uniform === 'function') {
+    try { return sodium.randombytes_uniform(n); } catch { /* fall through */ }
+  }
+  return Math.floor(Math.random() * n);
+}
+
+/**
+ * Resolve one accepted message to its live destination(s) and deliver. The
+ * relay re-resolves online/offline at FLUSH time (not send time), so a
+ * recipient who connected during the window still receives directly and one who
+ * went away falls back to the inbox queue. This mirrors the pre-mix `send`
+ * fan-out byte-for-byte.
+ *
+ * @returns {{ok: boolean, error?: string}}
+ */
+function deliverMixed(item) {
+  const { recipient, envelope, ts, directTo } = item;
+  if (Date.now() - ts > QUEUE_TTL_MS) return { ok: false, error: 'expired' };
+  // No sender field on the delivery (sealed sender): the recipient derives the
+  // sender from inside the authenticated envelope, keyed by the opaque
+  // per-session deliveryToken the envelope carries.
+  const run = (member) => sendPadded(member, { type: 'message', envelope });
+
+  // Subscribe-backlog flush: deliver to the joining client only, never re-broadcast
+  // to members who were already online when the message was queued.
+  if (directTo) {
+    if (!isAlive(directTo)) return queueMessage(recipient, envelope, ts);
+    run(directTo);
+    return { ok: true };
+  }
+
+  if (envelope.mode === 'group') {
+    const subs = groups.get(recipient);
+    const members = subs ? [...subs].filter(isAlive) : [];
+    if (members.length) { members.forEach(run); return { ok: true }; }
+    return queueMessage(recipient, envelope, ts);
+  }
+
+  const target = online.get(recipient);
+  if (isAlive(target)) { run(target); return { ok: true }; }
+  return queueMessage(recipient, envelope, ts);
+}
+
+/**
+ * Accept a message for relay. With mixing ON it enters the mix pool and is
+ * delivered at the next window close as part of one batch; with mixing OFF it
+ * is resolved and delivered immediately (the pre-mix behaviour, used by the
+ * deterministic suites). The `sent` ack is emitted by the caller at acceptance
+ * time — relay receipt, never batch release.
+ */
+function enqueueRelay(recipient, envelope, { directTo = null, ts = Date.now() } = {}) {
+  const item = { recipient, envelope, ts, directTo };
+  if (MIX_OFF) return deliverMixed(item);
+  mixPool.push(item);
+  scheduleMixFlush();
+  return { ok: true };
+}
+
+/**
+ * Open the window on the first message and close it MIX_WINDOW_MS later: a
+ * self-rescheduling timer, so a batch is a rolling window measured from the
+ * first arrival rather than from an arbitrary boot-aligned tick. That makes the
+ * delay bound exact (the first message waits the full window, later messages
+ * less) and the batching regression deterministic.
+ */
+function scheduleMixFlush() {
+  if (mixTimer !== null || mixPool.length === 0 || MIX_OFF) return;
+  mixTimer = setTimeout(() => {
+    mixTimer = null;
+    flushMixBatch();
+    scheduleMixFlush(); // more arrived during/after the flush -> next window
+  }, MIX_WINDOW_MS);
+  mixTimer.unref?.();
+}
+
+/**
+ * Close the current mix window: deliver everything in the pool as one batch.
+ * Delivery order is crypto-shuffled so per-recipient arrival order within the
+ * batch does not fingerprint the sender; optional jitter spreads pair deliveries
+ * while group fan-out stays identical-time.
+ */
+function flushMixBatch() {
+  if (mixPool.length === 0) return;
+  const batch = mixPool.splice(0, mixPool.length);
+
+  for (let i = batch.length - 1; i > 0; i--) {
+    const j = randomBelow(i + 1);
+    [batch[i], batch[j]] = [batch[j], batch[i]];
+  }
+
+  let dropped = 0;
+  for (const item of batch) {
+    const deliver = () => {
+      const r = deliverMixed(item);
+      if (!r.ok) {
+        dropped++;
+        if (VERBOSE) console.log(`[server] mix: dropped message to ${short(item.recipient)} (${r.error})`);
+      }
+    };
+    if (MIX_JITTER_MS > 0 && item.envelope.mode !== 'group') {
+      setTimeout(deliver, randomBelow(MIX_JITTER_MS));
+    } else {
+      deliver();
+    }
+  }
+
+  console.log(`[server] mix: flushed ${batch.length} message(s) in one batch`);
 }
 
 /**
@@ -178,6 +378,23 @@ function isPlausibleKeyPackage(kp) {
 function isPlausibleEnvelope(env) {
   if (!env || typeof env !== 'object') return false;
   if (env.v !== 6) return false;
+
+  // Sealed-sender delivery token (ANONYMITY.md Phase 1): opaque to the relay,
+  // but shape-checked so a hostile client cannot smuggle a non-token through
+  // the same field. It is a base64 32-byte id when present.
+  if (env.deliveryToken !== undefined &&
+      (typeof env.deliveryToken !== 'string' ||
+       Buffer.from(env.deliveryToken, 'base64').length !== 32)) return false;
+
+  // Cover traffic (ANONYMITY.md Phase 2): an opaque dummy the relay DISCARDS,
+  // never queues or delivers. Shape/size-validated so a hostile client cannot
+  // use the cover channel to flood inboxes. See the send handler for discard.
+  if (env.mode === 'cover') {
+    if (typeof env.ciphertext !== 'string' || !env.ciphertext) return false;
+    const cct = Buffer.from(env.ciphertext, 'base64');
+    if (cct.length === 0 || cct.length > MAX_GROUP_ENVELOPE_BYTES) return false;
+    return true;
+  }
 
   // Group mode (prototype — ROADMAP §7): accept an opaque MLS envelope. No
   // header, bundle, nonce, or signature fields are required — the ciphertext
@@ -238,7 +455,7 @@ function isPlausibleEnvelope(env) {
   return Buffer.from(env.ciphertext, 'base64').length > 0;
 }
 
-function handleLine(client, line) {
+async function handleLine(client, line) {
   let msg;
   try {
     msg = JSON.parse(line);
@@ -267,6 +484,16 @@ function handleLine(client, line) {
         sendLine(client, { type: 'error', error: 'invalid key package' });
         return;
       }
+
+      // Server-side deferral: the ML-KEM/ML-DSA graph is loaded HERE, on the
+      // first publish, not at startup. Report the loaded state first so the
+      // regression in src/server-deferral-regression.js can prove zero
+      // @noble modules were loaded before the first publish arrived.
+      if (!pqLoadedReported) {
+        pqLoadedReported = true;
+        console.log(`[server] @noble modules loaded before first publish: ${pqLoaded() ? 1 : 0}`);
+      }
+      await loadPQ();
 
       // Authenticated registration: the bundle must be self-signed (proving
       // the announcer holds the signing key) and the address must be the
@@ -303,7 +530,7 @@ function handleLine(client, line) {
       const existing = online.get(address);
       if (existing && existing !== client && isAlive(existing)) {
         sendLine(client, { type: 'error', error: 'address already registered by an active connection' });
-        console.log(`[server] rejected duplicate registration for ${short(address)}`);
+        if (VERBOSE) console.log(`[server] rejected duplicate registration for ${short(address)}`);
         return;
       }
 
@@ -312,7 +539,7 @@ function handleLine(client, line) {
       // never locked out by a stale mapping.
       if (client.pk && client.pk !== address && online.get(client.pk) === client) {
         online.delete(client.pk);
-        console.log(`[server] released previous address ${short(client.pk)}`);
+        if (VERBOSE) console.log(`[server] released previous address ${short(client.pk)}`);
       }
 
       client.pk = address;
@@ -320,36 +547,53 @@ function handleLine(client, line) {
 
       const queued = inbox.get(address) || [];
       inbox.delete(address);
+      // Catch-up delivery is mixed too (ROADMAP §8): a late registrant's burst
+      // of queued messages enters the window instead of bursting out instantly,
+      // which would leak exactly when and how much they missed. Preserve each
+      // item's original ts so the TTL sweep still expires it.
       for (const item of queued) {
-        sendPadded(client, { type: 'message', envelope: item.envelope, fromPk: item.fromPk });
+        enqueueRelay(address, item.envelope, { ts: item.ts });
       }
       sendLine(client, { type: 'published', address });
-      console.log(`[server] published+registered ${short(address)} (delivered ${queued.length} queued)`);
+      if (VERBOSE) console.log(`[server] published+registered ${short(address)} (delivered ${queued.length} queued)`);
       break;
     }
 
-    case 'fetch-directory': {
-      const { address } = msg;
-      if (typeof address !== 'string' || !address || address.length > 128) {
-        sendLine(client, { type: 'error', error: 'valid address required' });
+    case 'fetch-shard': {
+      // Private directory lookup (ANONYMITY.md Phase 1): the requester names a
+      // SHARD, never an address. The relay returns every entry whose address
+      // has that prefix, so its logs can only record "served shard #k" — it
+      // cannot answer "who looked up whom". The requester selects the target
+      // client-side from the self-signed bundles in the shard.
+      const { shard } = msg;
+      if (typeof shard !== 'string' || !shard || shard.length > 32) {
+        sendLine(client, { type: 'error', error: 'valid shard id required' });
         return;
       }
-      const entry = directory.get(address);
-      if (!entry) {
-        sendLine(client, { type: 'error', error: 'unknown address' });
+      const entries = [];
+      for (const [address, entry] of directory) {
+        if (directoryShard(address, DIR_SHARD_BYTES) !== shard) continue;
+        entries.push({
+          address,
+          bundle: entry.bundle,
+          keyPackage: entry.keyPackage || null,
+          oneTimePrekeys: [...entry.oneTimePrekeys.values()]
+            .sort((a, b) => a.id - b.id)
+            .map((o) => ({ id: o.id, dhPk: o.dhPk, signature: o.signature })),
+        });
+      }
+      // No prekey is consumed server-side: the relay cannot know WHICH entry
+      // the requester wanted, so single-use is enforced by the RECIPIENT
+      // burning the prekey on first use (and republishing its smaller pool).
+      // Deterministic per-sender selection (selectOneTimePrekey) keeps two
+      // distinct senders from colliding on the same prekey.
+      const payload = JSON.stringify({ type: 'directory-shard', shard, entries });
+      if (payload.length > MAX_LINE_BYTES) {
+        sendLine(client, { type: 'error', error: 'shard too large — raise DIR_SHARD_BYTES' });
         return;
       }
-      // Hand out one one-time prekey per fetch and consume it server-side, so
-      // a prekey is never reused across two sessions. An exhausted pool
-      // degrades to a prekey-less bootstrap.
-      let oneTimePrekey = null;
-      if (entry.oneTimePrekeys.size > 0) {
-        const firstId = entry.oneTimePrekeys.keys().next().value;
-        const otk = entry.oneTimePrekeys.get(firstId);
-        entry.oneTimePrekeys.delete(firstId);
-        oneTimePrekey = { id: otk.id, dhPk: otk.dhPk, signature: otk.signature };
-      }
-      sendLine(client, { type: 'directory', address, bundle: entry.bundle, oneTimePrekey, keyPackage: entry.keyPackage || null });
+      sendLine(client, { type: 'directory-shard', shard, entries });
+      if (VERBOSE) console.log(`[server] served shard ${short(shard)} (${entries.length} entries)`);
       break;
     }
 
@@ -370,11 +614,14 @@ function handleLine(client, line) {
       subs.add(client);
       const queued = inbox.get(group) || [];
       inbox.delete(group);
+      // Same rule as publish: a late joiner's backlog goes through the mix window
+      // (delivered to THIS client only, never re-broadcast to members who were
+      // already online) with its original ts preserved for TTL.
       for (const item of queued) {
-        sendPadded(client, { type: 'message', envelope: item.envelope, fromPk: item.fromPk });
+        enqueueRelay(group, item.envelope, { ts: item.ts, directTo: client });
       }
       sendLine(client, { type: 'subscribed', group });
-      console.log(`[server] client subscribed to group ${short(group)} (delivered ${queued.length} queued)`);
+      if (VERBOSE) console.log(`[server] client subscribed to group ${short(group)} (delivered ${queued.length} queued)`);
       break;
     }
 
@@ -389,38 +636,37 @@ function handleLine(client, line) {
         return;
       }
 
-      console.log(`[server] relaying ciphertext to ${short(toPk)} (opaque to relay)`);
-
-      // Group-mode envelope (prototype — ROADMAP §7): fan out to every online
-      // subscriber of the group_id, or queue for the group if none are online.
-      if (envelope.mode === 'group') {
-        const subs = groups.get(toPk);
-        const members = subs ? [...subs].filter(isAlive) : [];
-        if (members.length) {
-          for (const m of members) {
-            sendPadded(m, { type: 'message', envelope, fromPk: msg.fromPk || null });
-          }
-        } else {
-          const result = queueMessage(toPk, envelope, msg.fromPk || null);
-          if (!result.ok) {
-            sendLine(client, { type: 'error', error: result.error });
-            return;
-          }
+      // Cover traffic is DISCARDED at acceptance: never mixed, never queued,
+      // never delivered, and never logged per-recipient (only this aggregate
+      // counter). `sent` still acknowledges receipt so the sender's cadence
+      // loop completes like any other frame.
+      if (envelope.mode === 'cover') {
+        coverDiscarded++;
+        if (coverDiscarded % 1000 === 0) {
+          console.log(`[server] discarded ${coverDiscarded} cover frame(s) (never queued)`);
         }
         sendLine(client, { type: 'sent', toPk });
-        break;
+        return;
       }
 
-      // Pair flow (unchanged): route by registered address.
-      const target = online.get(toPk);
-      if (isAlive(target)) {
-        sendPadded(target, { type: 'message', envelope, fromPk: msg.fromPk || null });
-      } else {
-        const result = queueMessage(toPk, envelope, msg.fromPk || null);
-        if (!result.ok) {
-          sendLine(client, { type: 'error', error: result.error });
-          return;
-        }
+      // No per-recipient log line here (ANONYMITY.md §4): the relay must not
+      // build a who→whom record in its own operator logs. Only an aggregate
+      // counter is kept, so there is nothing to destroy, seize, or subpoena.
+      relayedCount++;
+      if (relayedCount % 1000 === 0) console.log(`[server] relayed ${relayedCount} message(s) (no per-recipient log kept)`);
+
+      // Pair and group traffic enter the SAME mix window (ROADMAP §8): one batch
+      // per window, so an observer cannot tell group-mode from pair-mode by
+      // timing, let alone which member sent what. `sent` acknowledges relay
+      // receipt immediately; delivery/queueing happens at window close (or
+      // immediately when mixing is off).
+      const result = enqueueRelay(toPk, envelope);
+      if (!result.ok) {
+        // With mixing ON the pool always accepts (capacity is enforced at flush
+        // and a full queue drops + logs); with MIX_OFF a queue-full is reported
+        // to the sender exactly as before mixing.
+        sendLine(client, { type: 'error', error: result.error });
+        return;
       }
       sendLine(client, { type: 'sent', toPk });
       break;
@@ -457,7 +703,7 @@ function makeStreamReader(client, onOverflow) {
     while ((idx = buffer.indexOf('\n')) !== -1) {
       const line = buffer.slice(0, idx).trim();
       buffer = buffer.slice(idx + 1);
-      if (line) handleLine(client, line);
+      if (line) handleLine(client, line).catch(() => {});
     }
   };
 }
@@ -475,7 +721,7 @@ function makeFrameReader(client, onOverflow) {
     }
     for (const line of payload.split('\n')) {
       const trimmed = line.trim();
-      if (trimmed) handleLine(client, trimmed);
+      if (trimmed) handleLine(client, trimmed).catch(() => {});
     }
   };
 }
@@ -487,7 +733,7 @@ function dropClient(client) {
   for (const subs of groups.values()) subs.delete(client);
 }
 
-const server = createServer((socket) => {
+function handleTcpSocket(socket) {
   console.log('[server] TCP client connected');
   const client = { type: 'tcp', raw: socket, pk: null };
   socket.setEncoding('utf8');
@@ -503,17 +749,46 @@ const server = createServer((socket) => {
     console.log('[server] TCP client disconnected');
   });
   socket.on('error', () => { /* ignore */ });
-});
+}
 
-// Bind the crypto core before any client can publish (registration verifies
-// the bundle signature), then start the WebSocket listener. The relay needs
-// ML-DSA verification the moment the first client registers, so it loads the
-// PQ graph at startup — unlike clients, whose init() defers it.
+// TLS on the client↔relay link (ANONYMITY.md §2) is ON by default: without it
+// a passive network observer reads every routing field in the clear. The relay
+// serves the committed loopback dev cert unless TLS_CERT/TLS_KEY point at the
+// operator's own pair; TLS_OFF=1 is the explicit opt-out (plaintext) for
+// debugging. If TLS is on and no keypair is found, the relay refuses to start —
+// running plaintext must be a conscious decision, never an accident.
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const DEFAULT_TLS_CERT = path.join(__dirname, '..', 'tools', 'certs', 'dev-cert.pem');
+const DEFAULT_TLS_KEY = path.join(__dirname, '..', 'tools', 'certs', 'dev-key.pem');
+const TLS_OFF = process.env.TLS_OFF === '1' || process.env.TLS_OFF === 'true';
+const TLS_CERT = process.env.TLS_CERT || DEFAULT_TLS_CERT;
+const TLS_KEY = process.env.TLS_KEY || DEFAULT_TLS_KEY;
+const useTls = !TLS_OFF;
+let tlsOptions = null;
+if (useTls) {
+  if (!existsSync(TLS_CERT) || !existsSync(TLS_KEY)) {
+    console.error(`[server] TLS is ON by default but no keypair found at:\n  cert: ${TLS_CERT}\n  key : ${TLS_KEY}\nProvide TLS_CERT/TLS_KEY, or set TLS_OFF=1 to run plaintext.`);
+    process.exit(1);
+  }
+  tlsOptions = { cert: readFileSync(TLS_CERT), key: readFileSync(TLS_KEY) };
+}
+
+const server = useTls
+  ? tls.createServer(tlsOptions, handleTcpSocket)
+  : createServer(handleTcpSocket);
+
+// Bind the crypto core (sodium only) before any client can publish. The
+// ML-KEM/ML-DSA graph is deferred to the FIRST publish (registration verifies
+// the bundle signature), so a relay that only ever routes ciphertext never
+// loads @noble/post-quantum — see the pqLoaded() report in the publish case.
 sodium = await init();
-await loadPQ();
 
-const wss = new WebSocketServer({ host: HOST, port: WS_PORT, maxPayload: MAX_LINE_BYTES }, () => {
-  console.log(`[server] WebSocket relay listening on ${HOST}:${WS_PORT}`);
+// The WebSocket side shares the same TLS decision: WSS when TLS_CERT/TLS_KEY are
+// set, plain WS otherwise.
+const wsHttp = useTls ? https.createServer(tlsOptions) : http.createServer();
+const wss = new WebSocketServer({ server: wsHttp, maxPayload: MAX_LINE_BYTES });
+wsHttp.listen(WS_PORT, HOST, () => {
+  console.log(`[server] ${useTls ? 'WSS' : 'WebSocket'} relay listening on ${HOST}:${WS_PORT}`);
 });
 
 wss.on('connection', (ws) => {
@@ -547,9 +822,24 @@ const sweep = setInterval(() => {
 }, SWEEP_INTERVAL_MS);
 sweep.unref();
 
+// Mixing is scheduled on-demand by scheduleMixFlush() (the window opens on the
+// first message). Announce the mode here so the operator knows it is active.
+if (!MIX_OFF) {
+  console.log(`[server] message mixing ON (window ${MIX_WINDOW_MS}ms, jitter ${MIX_JITTER_MS}ms) — set MIX_OFF=1 or MIX_WINDOW_MS=0 to disable`);
+}
+if (SANITIZE_LOG) {
+  console.log('[server] log sanitization ON (--sanitize-log) — every log line passes through stripControls()');
+}
+
 server.listen(PORT, HOST, () => {
-  console.log(`[server] ciphertext-only relay listening on ${HOST}:${PORT}`);
+  console.log(`[server] ciphertext-only relay listening on ${HOST}:${PORT}${useTls ? ' (TLS)' : ' (plaintext)'}`);
   console.log('[server] The relay never sees plaintext or keys — only ciphertext envelopes.');
+  console.log(`[server] retention: ${EPHEMERAL ? 'ephemeral — nothing is ever queued' : `${QUEUE_TTL_MS}ms TTL, memory-only`}, per-identity logs ${VERBOSE ? 'ON (verbose)' : 'OFF'}`);
+  if (useTls) {
+    console.log(`[server] TLS ON — ${TLS_CERT}; set TLS_OFF=1 to run plaintext.`);
+  } else {
+    console.log('[server] TLS OFF (opt-out) — routing fields are readable on the wire (see ANONYMITY.md §2).');
+  }
   if (HOST !== '127.0.0.1' && HOST !== '::1') {
     console.warn(`[server] WARNING: bound to ${HOST}, not loopback. See the trust model in src/server.js.`);
   }

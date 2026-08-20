@@ -57,7 +57,8 @@ function openBrowser(url) {
 }
 
 const relay = spawn(process.execPath, ['src/server.js'], {
-  env: { ...process.env, HOST, PORT: String(PORT), WS_PORT: String(WS_PORT) },
+  // TLS is default-on; this dev launcher keeps plaintext loopback for convenience.
+  env: { ...process.env, HOST, PORT: String(PORT), WS_PORT: String(WS_PORT), TLS_OFF: '1' },
   stdio: 'inherit',
 });
 const ui = spawn(process.execPath, ['tools/serve.mjs'], {
