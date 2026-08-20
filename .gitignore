@@ -6,3 +6,9 @@
 node_modules/
 scratch/
 *.log
+# Project-local Go age CLI install (fetched + verified by tools/fetch-age-cli.mjs)
+tools/.age-cli/
+# Freebuff session metadata — app-owned, not project source
+.freebuff/
+# Bootstrap-only splice artifacts (written by tools/.stage-bootstrap.mjs)
+.staged-*

@@ -21,11 +21,18 @@
  * allowlisted host. Re-pin deliberately with --update-manifest after
  * reviewing the hash diff.
  *
+ * The update is ALL-OR-NOTHING: downloads are staged in a temporary
+ * tools/.fonts-stage-<pid>-<ts>/ dir and verified, and only when every byte
+ * (woff2 files + fonts.css) has
+ * succeeded is the whole public/fonts/ directory swapped in. A mid-run
+ * failure, hash mismatch, or crash leaves the served fonts untouched — the
+ * dashboard never sees a partial font set.
+ *
  * Run with:  node tools/fetch-fonts.mjs                    (fetch + verify against pinned hashes)
  *            node tools/fetch-fonts.mjs --update-manifest  (re-pin after a reviewed font change)
  *            node tools/fetch-fonts.mjs --check            (verify public/fonts/ on disk, no network)
  */
-import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -164,52 +171,84 @@ async function main() {
     groups.get(key).weights.push({ weight, range: range.trim() });
   }
 
-  // Download each unique variable-font file, verifying every byte against the
-  // committed manifest before it is written.
-  rmSync(OUT, { recursive: true, force: true });
-  mkdirSync(OUT, { recursive: true });
+  // ---- Staged fetch (all-or-nothing) ----
+  // Every download lands in a sibling staging dir under tools/, verified
+  // against the committed manifest byte-for-byte, and only after ALL files
+  // (woff2 + fonts.css) have succeeded is public/fonts/ swapped into place.
+  // A failed fetch, hash mismatch, or crash mid-run leaves the served fonts
+  // directory untouched — the dashboard never sees a half-updated font set.
   const manifest = loadManifest();
   const nextManifest = {};
   let total = 0;
-  for (const g of groups.values()) {
-    assertSafeFontUrl(g.url);
-    const res = await fetch(g.url, { headers: { 'User-Agent': UA }, redirect: 'error' });
-    if (!res.ok) throw new Error(`font fetch failed (${res.status}): ${g.url}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    nextManifest[g.file] = verifyFont(g.file, buf, manifest, updateManifest);
-    writeFileSync(path.join(OUT, g.file), buf);
-    total += buf.length;
-    console.log(`  ${g.file.padEnd(44)} ${buf.length} B  (${g.weights.map((w) => w.weight).join(', ')} ${g.weights[0].range.slice(0, 12)}…)`);
-  }
-  if (!updateManifest && manifest) {
-    for (const f of Object.keys(manifest)) {
-      if (!nextManifest[f]) console.warn(`warn: pinned font ${f} is no longer downloaded (upstream change?)`);
+  let rules = [];
+  const stamp = `${process.pid}-${Date.now()}`;
+  const STAGE = path.join(ROOT, 'tools', `.fonts-stage-${stamp}`);
+  const OUT_OLD = path.join(ROOT, 'tools', `.fonts-old-${stamp}`);
+  try {
+    mkdirSync(STAGE, { recursive: true });
+    for (const g of groups.values()) {
+      assertSafeFontUrl(g.url);
+      const res = await fetch(g.url, { headers: { 'User-Agent': UA }, redirect: 'error' });
+      if (!res.ok) throw new Error(`font fetch failed (${res.status}): ${g.url}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      nextManifest[g.file] = verifyFont(g.file, buf, manifest, updateManifest);
+      writeFileSync(path.join(STAGE, g.file), buf);
+      total += buf.length;
+      console.log(`  ${g.file.padEnd(44)} ${buf.length} B  (${g.weights.map((w) => w.weight).join(', ')} ${g.weights[0].range.slice(0, 12)}…)`);
     }
+    if (!updateManifest && manifest) {
+      for (const f of Object.keys(manifest)) {
+        if (!nextManifest[f]) console.warn(`warn: pinned font ${f} is no longer downloaded (upstream change?)`);
+      }
+    }
+
+    // One @font-face per weight, all pointing at the shared variable file.
+    for (const [key, g] of groups) {
+      const [family, style] = key.split('|');
+      for (const w of g.weights) {
+        rules.push(
+          `@font-face {\n` +
+          `  font-family: '${family}';\n` +
+          `  font-style: ${style};\n` +
+          `  font-weight: ${w.weight};\n` +
+          `  font-display: swap;\n` +
+          `  src: url('./${g.file}') format('woff2');\n` +
+          `  unicode-range: ${w.range};\n` +
+          `}`
+        );
+      }
+    }
+    const header =
+      `/* Self-hosted fonts for public/index.html — fetched from Google Fonts (SIL OFL 1.1).\n` +
+      ` * Source: ${FONTS_URL}\n` +
+      ` * Regenerate with: node tools/fetch-fonts.mjs\n` +
+      ` */\n\n`;
+    writeFileSync(path.join(STAGE, 'fonts.css'), header + rules.join('\n\n') + '\n');
+
+    // ---- Swap phase: public/fonts/ is touched only here, and only after
+    // every staged byte has verified ----
+    const hadOld = existsSync(OUT);
+    if (hadOld) renameSync(OUT, OUT_OLD);
+    try {
+      renameSync(STAGE, OUT);
+    } catch (e) {
+      // Put the previous font set back before propagating the failure.
+      if (hadOld && existsSync(OUT_OLD)) {
+        try {
+          renameSync(OUT_OLD, OUT);
+        } catch (restoreErr) {
+          console.error(`CRITICAL: could not restore previous fonts — backup preserved at ${OUT_OLD}`);
+        }
+      }
+      throw e;
+    }
+    if (hadOld) rmSync(OUT_OLD, { recursive: true, force: true });
+  } finally {
+    // The stage dir is gone after a successful rename; on failure it is
+    // removed here so a partial download never lingers in the repo.
+    if (existsSync(STAGE)) rmSync(STAGE, { recursive: true, force: true });
   }
 
-  // One @font-face per weight, all pointing at the shared variable file.
-  const rules = [];
-  for (const [key, g] of groups) {
-    const [family, style] = key.split('|');
-    for (const w of g.weights) {
-      rules.push(
-        `@font-face {\n` +
-        `  font-family: '${family}';\n` +
-        `  font-style: ${style};\n` +
-        `  font-weight: ${w.weight};\n` +
-        `  font-display: swap;\n` +
-        `  src: url('./${g.file}') format('woff2');\n` +
-        `  unicode-range: ${w.range};\n` +
-        `}`
-      );
-    }
-  }
-  const header =
-    `/* Self-hosted fonts for public/index.html — fetched from Google Fonts (SIL OFL 1.1).\n` +
-    ` * Source: ${FONTS_URL}\n` +
-    ` * Regenerate with: node tools/fetch-fonts.mjs\n` +
-    ` */\n\n`;
-  writeFileSync(path.join(OUT, 'fonts.css'), header + rules.join('\n\n') + '\n');
   console.log(`\nwrote ${groups.size} variable font files (${(total / 1024).toFixed(1)} KB) + ${rules.length} @font-face rules in public/fonts/fonts.css`);
 
   if (updateManifest) {

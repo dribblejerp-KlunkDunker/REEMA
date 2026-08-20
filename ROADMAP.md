@@ -22,7 +22,8 @@ into the root (X3DH `DH3`).
   then mixed with the one-time-prekey shared secret), and the first message
   carries a KEM encapsulation to the peer's published `kemPk`.
 - **Bootstrap forward secrecy.** Each new session consumes a fresh one-time
-  prekey served by the directory, so the first message is no longer
+  prekey (selected deterministically per sender from the served shard, then
+  burned by the recipient on first receive), so the first message is no longer
   deterministic per identity (README Limitation 7 is closed).
 - **The last initiator/responder race is closed.** Either side may send the
   first message; two peers who both send first before receiving converge (the
@@ -36,9 +37,11 @@ into the root (X3DH `DH3`).
   and that the claimed address equals `deriveAddress(signPk, dhPk)`, so a
   hostile client cannot claim an offline user's address (README Limitation 1
   is closed).
-- **Key directory removes TOFU for the bootstrap.** Address mode fetches the
-  bundle + one-time prekey from the directory and re-verifies both; bundle mode
-  remains for offline first contact (README Limitation 2 is closed).
+- **Key directory removes TOFU for the bootstrap — privately.** Address mode
+  fetches the WHOLE shard containing the peer (the relay learns only the shard,
+  never the address) and re-verifies the selected bundle; bundle mode remains
+  for offline first contact (README Limitation 2 is closed). The relay cannot
+  answer "who looked up whom" (ANONYMITY.md Phase 1).
 
 Design notes and tradeoffs:
 
@@ -138,8 +141,8 @@ Sessions survive a restart (a reload no longer desyncs the ratchet forever).
 ### ✅ P1 — Fuzz / property harness into `npm test`
 
 `src/fuzz.js` is wired into `npm test` (see `package.json` for the exact stage
-chain — `test.js`, `fuzz.js`, `browser-e2e.js`, `xss-regression.js`,
-`doc-consistency.js`):
+chain — `test.js`, `fuzz.js`, `fuzz-sanitize.js`, `browser-e2e.js`,
+`xss-regression.js`, `doc-consistency.js`):
 
 - 1500 seeded mutation iterations against a live session (bit flips, counter
   bumps, replays, attacker re-signatures), asserting no acceptance unless the
@@ -266,8 +269,20 @@ evicted. The relay's structural validation blocks the junk upstream.
 npm run demo        # two-party demo + security assertions (v6: bootstrap forgery, null-chain, serialize round-trip, crash recovery)
 npm test            # integration + fuzzer + headless two-context browser E2E + XSS regression + messenger smoke + doc-consistency
 node src/fuzz.js    # the fuzzer alone (seeded, reproducible)
+node src/fuzz-sanitize.js  # the stripControls property fuzzer alone (seeded, reproducible)
+node src/mix-regression.js  # relay message-mixing batching regression (spawns its own relays, mixing ON vs MIX_OFF)
+node src/cover-regression.js  # cover-traffic regression (relay discards cover; size parity; real delivery unaffected)
+node src/tls-regression.js  # TLS-on-the-link regression (encrypted wire, fingerprint pin fails closed)
+node src/retention-regression.js  # metadata self-destruct (TTL) + no-identity-log regression
+node src/ephemeral-regression.js  # RELAY_EPHEMERAL zero-retention (never queues) regression
+node src/server-deferral-regression.js  # relay defers the @noble/post-quantum graph until the first publish
+node src/sealed-sender-regression.js  # sealed sender + delivery tokens + instrumented-relay acceptance
+node src/private-directory-regression.js  # sharded private lookup: instrumented relay can't learn who-looked-up-whom
 node src/browser-e2e.js  # the browser E2E alone (spawns its own servers; skips if no browser)
 node src/messenger-smoke.js  # the messenger smoke alone (A-B-A through public/messenger.html; skips if no browser)
+node src/verdad-interop.js  # Node interop + fuzz of the vendored AEGIS brain (verdicts, binding, rebuttal)
+node src/messenger-verdad.js  # headless VERDAD gate/flags/signed-rebuttal E2E (skips if no browser)
+node src/browser-tor-regression.js  # browser WebSocket through a mock SOCKS5 (Tor) proxy + fail-closed (skips if no browser)
 node src/doc-consistency.js  # doc-vs-code checks: bundle size, cited files, ports, npm-test stages
 node src/index.js address  # print the 44-char bound routing address
 node src/index.js bundle   # print the full self-signed prekey bundle
@@ -306,7 +321,7 @@ Each item below is tied to a proving test in the tree. The encryption layer is
 | 1 | Hybrid PQ bootstrap (X25519 + ML-KEM-768) | `src/demo.js` (root/epoch assertions) |
 | 2 | No initiator/responder role; simultaneous firsts converge | `src/demo.js`, `src/test.js` |
 | 3 | One-time prekeys give bootstrap forward secrecy | `src/test.js` (OTK consumed + burned) |
-| 4 | Key directory + bound address + proof-of-possession | `src/test.js` (publish/fetch-directory/claim-rejected) |
+| 4 | Key directory + bound address + proof-of-possession | `src/test.js` (publish/fetch-shard/claim-rejected) |
 | 5 | Authenticated registration (no offline-address theft) | `src/test.js` |
 | 6 | Double Ratchet + replay + skip window + atomic commit | `src/demo.js`, `src/fuzz.js` |
 | 7 | Steady-state envelope shrink (~53%) | `src/browser-e2e.js` (size assertion) |
@@ -319,6 +334,8 @@ Each item below is tied to a proving test in the tree. The encryption layer is
 | 13 | Gemini render-path XSS + key hygiene | `src/xss-regression.js` |
 | 14 | Docs ↔ code drift | `src/doc-consistency.js` |
 | 15 | Minimal two-party test app over the core | `src/messenger-smoke.js` (headless A→B→A, in `npm test`) |
+| 17 | VERDAD pre-send gate + inbound flags (brain on spine) | `src/messenger-verdad.js` (headless E2E), `src/verdad-interop.js` (Node interop) |
+| 18 | DID-signed rebuttal + binding credential verification | `src/verdad-interop.js` (tamper fail-closed), `src/messenger-verdad.js` (verified in place) |
 
 **Remaining non-crypto items (documented, out of scope for the core):** relay
 metadata (mixnet), OS-keychain storage for the CLI identity key, and the
@@ -351,11 +368,11 @@ combined. Its verbs map 1:1:
 | Current v6 primitive | MLS (RFC 9420) equivalent |
 |---|---|
 | `publish {address, bundle, oneTimePrekeys}` | Publish a signed `KeyPackage` to the DS/AS |
-| `fetch-directory {address}` → bundle + one OTK | Fetch a member's `KeyPackage` to Add them |
-| `send {toPk, envelope, fromPk}` | `PrivateMessage` / `Welcome` / `Commit` addressed by `group_id` |
+| `fetch-shard {shard}` → whole bucket of bundles + prekey pools | Fetch a member's `KeyPackage` to Add them (address hidden among the shard) |
+| `send {toPk, envelope}` | `PrivateMessage` / `Welcome` / `Commit` addressed by `group_id` |
 | routing `address` — `BLAKE2b-32(signPk \|\| staticDhPk)`, 44-char b64 | `group_id` — any 32-byte value, **same 44-char b64 shape** |
 | `envelope` (opaque to the relay) | MLS message (opaque to the relay) |
-| OTK pool (consumed server-side on fetch) | `KeyPackage.init_key` (single-use HPKE) |
+| OTK pool (served in the shard; burned recipient-side) | `KeyPackage.init_key` (single-use HPKE) |
 | `online` / `inbox` maps | DS presence + store-and-forward queues |
 
 The decisive point: **`group_id` is structurally identical to today's routing
@@ -366,7 +383,7 @@ perspective.
 ### What stays byte-for-byte (no wire change)
 
 - Newline TCP + WebSocket framing, and all four verb names (`publish`,
-  `fetch-directory`, `send`, `ping`).
+  `fetch-shard`, `send`, `ping`).
 - The `online`, `inbox`, `directory` maps and their queue/sweep behavior.
 - Authenticated registration: the self-signed-bundle proof-of-possession check
   becomes the KeyPackage signature check (same identity-pinning idea).
@@ -383,7 +400,7 @@ perspective.
    group_label || nonce)` — 32 bytes, so it reuses the existing 44-char shape
    the relay already treats as opaque.
 3. **Group lifecycle (all client-side):**
-   - **Create** — the creator `fetch-directory`s each invitee's KeyPackage,
+   - **Create** — the creator `fetch-shard`s each invitee's KeyPackage,
      builds a ratchet tree, and emits one `Commit` (to the group) plus one
      `Welcome` per member (HPKE-encrypted to their `init_key`).
    - **Add** — any member proposes `Add`; the committer sends `Commit` +
@@ -393,10 +410,9 @@ perspective.
      mls_private_message}`.
    - **Remove / leave** — a `Remove` proposal + `Commit`; every remaining
      member advances the epoch and wipes the old epoch secrets.
-   - **One-time prekey exhaustion** — each Add consumes one KeyPackage; the
-     relay's existing consume-on-fetch behavior already matches MLS's "one
-     KeyPackage per Add" rule, and clients must replenish their published OTK
-     pool as it drains.
+   - **One-time prekey exhaustion** — each Add consumes one KeyPackage; single-use
+     is enforced recipient-side (the prekey is burned on first use) and clients
+     must replenish their published OTK pool as it drains.
 
 ### Security properties (what MLS buys, at what cost)
 
@@ -420,3 +436,138 @@ perspective.
 3. **Welcome transport** — the prototype rides a normal `send` to the new
    member's address inside an existing pair-session envelope (no new verb); a
    dedicated `welcome` verb remains the alternative.
+
+---
+
+## 8. Design — relay metadata resistance: message mixing with delays (2026-08-18) ✅ built
+
+Design for **basic metadata resistance** at the relay — message mixing /
+batching with delays — **without changing the client wire protocol**. Status:
+**built 2026-08-19** (`src/server.js`, proven by `src/mix-regression.js`).
+Extends the base sketch with the `subscribe` group fan-out (§7): batched/delayed
+*group* deliveries so message mixing hides which member sent which message.
+
+### The core insight: the relay already has everything except a delay discipline
+
+The relay already delivers **fixed-size padded envelopes** (`sendPadded`, 12 KB
+buckets) through a **store-and-forward inbox** (`queueMessage` / `inbox` /
+`inbox` sweep). Envelopes are opaque — the relay never parses plaintext, keys,
+or MLS. The only thing missing for basic mixing is **scheduling**: today a
+`send` is fanned out (pair target or group subscribers) the instant it lands,
+so a relay observer — or a passive network observer — can correlate a sender's
+send moment with a recipient's receive moment. That correlation is the
+metadata leak; padding already hides *size*, mixing is what hides *timing*.
+
+Adding a mixing loop is a **relay-internal scheduling change, not a protocol
+change**: no new verbs, no envelope-shape change, no client update.
+
+### The mixing loop (one loop serves pair and group traffic)
+
+1. On `send`, instead of delivering immediately, the envelope enters a **mix
+   window** (`MIX_WINDOW_MS`, default ~0.5–2 s, env-configurable). The existing
+   `inbox` / queue machinery is reused; the `ts` field already present on
+   queued items becomes the window deadline.
+2. A ticker (same pattern as the existing `sweep` interval) **closes the
+   window** and delivers everything due as one batch: every pair recipient and
+   every group subscriber in the batch is served in the same tick.
+3. Optional intra-batch **jitter + delivery-order shuffle**, so per-recipient
+   arrival times within the batch don't leak ordering.
+4. Because every delivery is already `sendPadded` to the same 12 KB bucket,
+   the wire looks like a steady stream of identical-size frames regardless of
+   what is inside — batching breaks the send-time → deliver-time correlation
+   without changing a single byte on the wire.
+
+### The subscribe fan-out dimension (what this section adds to the sketch)
+
+Today a group envelope is fanned out to every online subscriber **at the
+instant the sender's `send` lands** — so an observer who sees one connection
+emit and N member connections receive in the same instant learns the sender
+*and* the membership, even though every envelope is opaque. With the mixing
+loop:
+
+- **Group envelopes enter the same window as pair traffic.** When the window
+  closes, the relay fans out the *whole batch*: every member of every group in
+  the batch receives their envelopes in the same tick, and pair recipients get
+  theirs in the same tick too. An observer can no longer tell group-mode from
+  pair-mode by timing, let alone which member sent what.
+- **Message mixing hides which member sent which message.** In a busy group,
+  several senders' envelopes accumulate in the same window and are released
+  together — a single batch of N deliveries to M members at time T with no
+  per-sender attribution. In the limit (all members online), **every member
+  receives every group message at the same time**; uniform delivery times make
+  the sender indistinguishable within the batch.
+- **The subscribe flush path is mixed too.** Queued group messages flushed on
+  `subscribe` (§7) currently burst out the moment a member connects — a timing
+  side channel revealing exactly when and how much a joining member missed.
+  The flush should also pass through the mix window (or at minimum be jittered)
+  so a late joiner's catch-up burst carries no extra signal.
+
+Ordering stays correct without any client change: group envelopes already
+carry the sender's b64 address and a **per-sender counter `n`** (validated but
+unused by the relay), so clients reorder deliveries per sender after a batch
+lands — exactly how they already tolerate reordered/queued delivery today.
+
+### What stays byte-for-byte (no wire change)
+
+- All verbs (`publish`, `fetch-shard`, `send`, `subscribe`, `ping`), TCP +
+  WebSocket framing, envelope shapes, and the `pad` field semantics.
+- The `online`, `inbox`, `groups` maps and their queue/sweep behavior
+  (mixing reuses them; it does not replace them).
+- Clients: **zero changes required.** Delivery latency was already tolerated
+  (queued/offline delivery), and per-sender `n` counters already give ordering.
+
+### What changes relay-side only
+
+- A `mix()` scheduling path: window, batch ticker, intra-batch jitter/order
+  shuffle — **opt-out via `MIX_OFF=1` or `MIX_WINDOW_MS=0`** so the existing
+  deterministic test suites and latency-sensitive flows stay fast.
+- The sender's `sent` ack: design decision — it should acknowledge *relay
+  receipt* (fire immediately on `send`) rather than batch release, keeping the
+  protocol honest; the recipient's delivery receipt (§6 row 16) remains the
+  end-to-end confirmation.
+- Sweep interaction: windowed messages still respect the existing TTL; mixing
+  must never resurrect or re-deliver an expired message.
+
+### Security properties (what it buys, honestly)
+
+- **Breaks send-time → deliver-time correlation** — the cheap, high-value
+  win, achieved with a relay-only scheduling change.
+- **Sender ambiguity within a batch** — in a group with k messages in a
+  window, the sender of any one is hidden among k (k-anonymity of the batch
+  size). The anonymity set is the *traffic in the window*, which is why the
+  loop deliberately mixes pair and group traffic together.
+- **Uniform group delivery times** — every member sees every message at the
+  same tick, removing per-member timing fingerprints from group traffic.
+- **It is NOT a mixnet.** At low traffic a window holds one message and the
+  anonymity set is 1; the relay still sees the full sender/recipient graph over
+  time (traffic analysis with a long observation window defeats it). This is
+  defense-in-depth for the existing threat model, not anonymity — the §6
+  "relay metadata (mixnet)" item (Tor/Vuvuzela-style) remains the real
+  anonymity plan.
+
+### Decisions made at build time (2026-08-19)
+
+1. **Window discipline** — a rolling window measured from the first message: a
+   self-rescheduling timer closes the batch `MIX_WINDOW_MS` after the first
+   arrival, so the first message waits the full window and later arrivals less.
+   Default `MIX_WINDOW_MS=1000`. (A boot-aligned ticker would let a message
+   slip out near-instantly when it lands just before a tick; the rolling window
+   makes the delay bound exact and the regression deterministic.)
+2. **Ack timing** — `sent` acknowledges **relay receipt immediately** (not batch
+   release); the recipient's delivery receipt remains the end-to-end
+   confirmation. With mixing ON a queue-capacity failure is therefore only
+   discoverable at flush (dropped + logged); `MIX_OFF` preserves the pre-mix
+   synchronous `recipient queue full` error.
+3. **Group release discipline** — identical-time for group fan-out (maximizes
+   sender hiding), optional `MIX_JITTER_MS` jitter for pair traffic only
+   (default 0). Delivery order within a batch is crypto-shuffled (`sodium`
+   RNG) so per-recipient arrival order cannot fingerprint the sender.
+4. **Testability** — `src/mix-regression.js` spawns two relays (mixing ON at
+   300 ms and `MIX_OFF=1`) and asserts: immediate `sent` ack; no delivery
+   before the window closes; two messages to two members flush as one tick;
+   and immediate delivery when off. The four existing relay-spawning suites run
+   with `MIX_OFF=1` to stay deterministic and fast.
+
+**Explicitly unchanged:** all verbs, wire framing, envelope shapes, and the
+`pad` field — mixing is a relay-internal scheduling change only, so clients
+needed zero changes.

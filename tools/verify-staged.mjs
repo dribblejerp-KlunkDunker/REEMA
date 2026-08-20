@@ -118,6 +118,67 @@ function syntaxCheckJs(label, text) {
   return true;
 }
 
+// Strip // and /* */ comments so doc examples and commented-out imports
+// cannot be mistaken for real ones. Strings and template literals are
+// respected (their contents are copied through, so real import specifiers
+// inside them still surface).
+function stripComments(text) {
+  let out = '';
+  let i = 0;
+  const n = text.length;
+  let inStr = null;
+  while (i < n) {
+    const c = text[i], d = text[i + 1];
+    if (inStr) {
+      if (inStr === '`') {
+        // Blank template-literal interiors (dynamic content — never a real
+        // import specifier; their inner quotes would otherwise match).
+        if (c === '`') inStr = null;
+        out += ' ';
+        i++;
+        continue;
+      }
+      // ' or " — copy through; real import specifiers live here.
+      out += c;
+      if (c === '\\') { if (i + 1 < n) { out += text[i + 1]; i++; } i++; continue; }
+      if (c === inStr) inStr = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; out += c; i++; continue; }
+    if (c === '/' && d === '/') { while (i < n && text[i] !== '\n') i++; continue; }
+    if (c === '/' && d === '*') {
+      i += 2;
+      while (i < n && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '/') {
+      // Heuristic: `/` after an operator/opener is a REGEX literal (whose
+      // quoted char classes must not desync the string state); after a word
+      // char it is division. Skip the regex body, honouring \/ escapes and
+      // [...] classes.
+      const prev = out.trimEnd().slice(-1);
+      const regexExpected = prev === '' || /[\(,=:!&|?{}\[;]/.test(prev);
+      if (regexExpected) {
+        let j = i + 1;
+        let inClass = false;
+        while (j < n) {
+          const ch = text[j];
+          if (ch === '\\') { j += 2; continue; }
+          if (ch === '[') inClass = true;
+          else if (ch === ']') inClass = false;
+          else if (ch === '/' && !inClass) break;
+          j++;
+        }
+        if (j < n) { i = j + 1; continue; }
+      }
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
 // All quoted import/export specifiers: `from 'x'`, `import 'x'`,
 // `export ... from 'x'`, dynamic `import('x')` with a string literal.
 const IMPORT_RE = /\b(?:import|export)\b[^;"']*?\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s*['"]([^'"\n]+)['"]/g;
@@ -140,8 +201,9 @@ function bareName(spec) {
 function checkImports(file, text, pkg) {
   let bad = 0;
   let m;
+  const code = stripComments(text);
   IMPORT_RE.lastIndex = 0;
-  while ((m = IMPORT_RE.exec(text)) !== null) {
+  while ((m = IMPORT_RE.exec(code)) !== null) {
     const spec = m[1] ?? m[2] ?? m[3];
     if (!spec) continue;
     if (spec.startsWith('.')) {

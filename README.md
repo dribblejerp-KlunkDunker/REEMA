@@ -25,7 +25,7 @@ headless browser E2E tests.
 | Symmetric AEAD | **XSalsa20-Poly1305** | `crypto_secretbox` |
 | Ratchet | Signal-style Double Ratchet | DH + KEM epochs, per-message chain keys |
 | Bootstrap | **self-signed prekey bundles + one-time prekeys** | X3DH-style; no initiator/responder role; per-session forward secrecy |
-| Key directory | relay-served `{ bundle, oneTimePrekey }` | address-keyed; proof-of-possession registration |
+| Key directory | relay-served **shard** of `{ bundle, oneTimePrekeys }` | proof-of-possession registration; whole-shard fetch hides the lookup |
 
 Confidentiality is **hybrid**: an attacker must break *both* X25519 and
 ML-KEM-768. Authentication is post-quantum only (ML-DSA-65), so there is no
@@ -53,8 +53,11 @@ sender mixes one consumed one-time prekey into the root (X3DH `DH3`), so:
   first message before receiving still converge.
 
 Senders may still address a peer by bundle (offline / no directory); address
-mode fetches the bundle + a one-time prekey from the directory instead, which
-removes trust-on-first-use for the bootstrap.
+mode fetches the **whole shard** containing the peer (the relay learns only the
+shard, never which address was wanted), selects the target client-side from the
+self-signed bundles, and picks a one-time prekey deterministically per
+(sender, recipient). This removes trust-on-first-use for the bootstrap AND the
+relay's ability to record "who looked up whom" (ANONYMITY.md Phase 1).
 
 ### Envelope
 
@@ -62,6 +65,7 @@ removes trust-on-first-use for the bootstrap.
 {
   "v": 6,
   "senderDhPk":   "…",  // X25519 public key, 32 bytes (the routing address is derived from it)
+  "deliveryToken": "…", // opaque per-session id, 32 bytes — sealed-sender dispatch key
   "senderSignPk": "…",  // ML-DSA-65 public key, 1952 bytes — FIRST message only
   "header": { "dh": "…", "pq_pk": "…", "pq_ct": "…", "pn": 0, "n": 0,
               "first": true,           // only on the very first message
@@ -117,10 +121,24 @@ never transmitted, binding each envelope to one conversation.
 │   ├── tor.js         # SOCKS5 routing, fails closed
 │   ├── demo.js        # two-party demo + security assertions
 │   ├── test.js        # integration test through the relay
+│   ├── mix-regression.js  # relay-side message-mixing batching regression (npm test)
+│   ├── cover.js       # cover-traffic envelopes + cadence (ANONYMITY.md Phase 2)
+│   ├── cover-regression.js  # cover-traffic discard/size-parity regression (npm test)
+│   ├── tls.js         # fingerprint-pinned TLS connect (ANONYMITY.md §2)
+│   ├── tls-regression.js    # TLS-on-the-link regression: encrypted wire, pin fail-closed (npm test)
+│   ├── retention-regression.js  # metadata self-destruct + no-identity-log regression (npm test)
+│   ├── ephemeral-regression.js  # RELAY_EPHEMERAL zero-retention regression (npm test)
+│   ├── server-deferral-regression.js  # relay loads @noble/post-quantum only at first publish (npm test)
+│   ├── sealed-sender-regression.js  # sealed sender + delivery-token + instrumented-relay acceptance (npm test)
+│   ├── private-directory-regression.js  # sharded private lookup: relay can't learn who-looked-up-whom (npm test)
 │   ├── fuzz.js        # mutation fuzzer for ratchet state integrity
+│   ├── fuzz-sanitize.js  # property fuzzer: stripControls stays control-free (npm test)
 │   ├── browser-e2e.js # headless two-context browser E2E (npm test)
 │   ├── xss-regression.js   # headless XSS regression for the Gemini render path (npm test)
 │   ├── messenger-smoke.js   # headless A-B-A smoke test of public/messenger.html (npm test)
+│   ├── verdad-interop.js    # Node interop + fuzz of the vendored AEGIS brain (npm test)
+│   ├── messenger-verdad.js  # headless VERDAD gate/flags/signed-rebuttal E2E (npm test)
+│   ├── browser-tor-regression.js  # browser WebSocket through a mock SOCKS5 (Tor) proxy + fail-closed (npm test)
 │   ├── doc-consistency.js  # doc-vs-code checks (bundle size, cited files, ports, npm-test stages)
 │   ├── vault.js       # Node entry for the vault-at-rest layer (re-exports vault-core)
 │   └── index.js       # keygen / bundle / pubkey / info / vault-*
@@ -132,10 +150,14 @@ never transmitted, binding each envelope to one conversation.
 │   ├── index.html     # dashboard UI with an E2EE Network tab + age vault panel
 │   ├── messenger.html # minimal two-party messaging app over the same core
 │   ├── fonts/         # self-hosted fonts (SIL OFL 1.1) + local fonts.css
-│   └── vendor/        # vendored libsodium + @noble + age-encryption — no CDN at runtime
+│   ├── vendor/        # vendored libsodium + @noble + age-encryption — no CDN at runtime
+│   └── aegis/         # vendored AEGIS brain (VERDAD gate + DID binding), SHA-256 pinned
 └── tools/
     ├── vendor.mjs     # regenerate public/vendor from node_modules
+    ├── vendor-aegis.mjs  # regenerate public/aegis from the AEGIS tree (SHA-256 pinned)
     ├── fetch-fonts.mjs    # regenerate public/fonts from Google Fonts (latin subsets only)
+    ├── messenger.mjs   # local dev launcher (relay + UI + open browser)
+    ├── messenger-tor.mjs  # Tor-routed browser shell (npm run messenger-tor)
     └── serve.mjs      # static server: brotli/gzip + cache headers (loopback only)
 ```
 
@@ -153,12 +175,14 @@ npm run demo
 
 Integration test through the relay (incl. a malformed-envelope crash
 regression — crafted packet types must reject, not kill the process), plus the
-mutation fuzzer, a headless
+mutation fuzzer, a relay-side message-mixing batching regression, a headless
 two-context browser E2E, a headless XSS regression for the Gemini render path,
 a headless messenger smoke test (an A→B→A flow through `public/messenger.html`),
-and a doc-consistency check that keeps the README/ROADMAP bundle-size figures
-tied to the measured value. The three browser stages skip gracefully if the
-headless browser isn't available:
+a headless VERDAD pre-send gate E2E, a browser Tor-routing regression (the
+browser's WebSocket traverses a mock SOCKS5 proxy, and `resolveTorProxy()` fails
+closed when Tor is down), and a doc-consistency check that keeps the
+README/ROADMAP bundle-size figures tied to the measured value. The browser
+stages skip gracefully if the headless browser isn't available:
 
 ```bash
 npm test
@@ -171,7 +195,7 @@ the sessions survive in `localStorage` and the ratchet continues. It ends with
 a Node-vs-browser differential leg: a pure-Node peer and the browser peer
 exchange envelopes through the relay in both directions, proving the two
 stacks share one wire format. It points the page at its own relay via the
-`?relay=ws://host:port` query parameter.
+`?relay=ws://host:port` (or `wss://…`) query parameter.
 
 Browser client — one command (relay + static server + opens the messenger):
 
@@ -183,6 +207,20 @@ Override the loopback ports with `MESSENGER_HOST`, `MESSENGER_RELAY_PORT`,
 `MESSENGER_WS_PORT`, or `MESSENGER_UI_PORT`. Ctrl+C stops both servers. Open a
 second profile (private/incognito window) at the printed URL for a two-party
 conversation.
+
+Browser client through **Tor** (hides your IP from a REMOTE relay):
+
+```bash
+MESSENGER_TOR_RELAY=wss://<onion-or-public-host>:<port> npm run messenger-tor
+```
+
+This launches the bundled Chromium with its proxy set to the local Tor SOCKS5
+listener, so the relay WebSocket leaves through Tor while the loopback UI stays
+direct. It **fails closed** — refuses to start if Tor is unreachable, and
+requires a remote `wss://` relay (a loopback relay through Tor buys nothing).
+The remote relay must present a CA-trusted certificate: the browser cannot
+TOFU-pin a raw WebSocket, so a self-signed relay is refused rather than silently
+trusted (recorded in `ANONYMITY.md`).
 
 Browser client — three terminals:
 
@@ -258,6 +296,16 @@ core is lazy-imported so nothing age-related loads at first paint. The headless
 browser E2E exports in one context and restores in another (both classical and
 hybrid), asserting the identity keys and routing address survive exactly.
 
+**Interop with the reference Go age CLI is byte-verified in both directions**
+(classical and hybrid): the real `age` binary decrypts the browser's exported
+vaults byte-for-byte, and files the Go CLI encrypts to a BlackVault recipient
+(including the PQ-hybrid `age1pq1...` recipient) decrypt back to the exact
+identity bytes in the browser. Install the pinned, SHA-256-verified CLI
+project-locally with `npm run fetch:age` (verify with `npm run check:age`;
+`tools/fetch-age-cli.mjs` downloads a pinned Go age ≥ v1.2.0 from the official
+release and refuses a hash mismatch). The checks skip gracefully when no age
+CLI is present, so `npm test` never depends on a system install.
+
 ---
 
 ## Security properties
@@ -296,9 +344,51 @@ hybrid), asserting the identity keys and routing address survive exactly.
 - **No CDN** — all cryptography is served from `public/vendor/`, and the UI's
   fonts are self-hosted in `public/fonts/` (regenerate with `tools/fetch-fonts.mjs`;
   every woff2 is verified against committed SHA-256 pins in `tools/fonts-manifest.json`,
-  so even the font CDN cannot silently substitute bytes).
+  so even the font CDN cannot silently substitute bytes, and the update is
+  all-or-nothing: fonts are staged and verified before `public/fonts/` is swapped
+  in, so a failed fetch never leaves a partial font set).
+  The vendored crypto is pinned the same way: every file in `public/vendor/` has
+  a committed SHA-256 in `tools/vendor-manifest.json`, verified by `npm test`
+  (via `npm run check:vendor`) and re-verified by the dev server at startup,
+  which refuses to serve any `/vendor/` path on mismatch — a tampered crypto
+  file fails CI and is refused at serve time, never silently shipped.
   A CDN can serve different bytes to different visitors; for a messaging app that
   means it can serve a backdoored cipher.
+
+## Performance
+
+- **The post-quantum graph is deferred out of the initial module graph.**
+  `init()` (both adapters, `src/crypto.js` and `public/browser-crypto.js`)
+  binds libsodium only; the ML-KEM-768 / ML-DSA-65 implementations and their
+  @noble/hashes + @noble/curves dependencies (~67 KB brotli) are fetched via
+  the dynamic import in `public/crypto-core.js` (`loadPQ()`) on first use —
+  identity keygen for a fresh user, or the first session establishment
+  (send/receive) for a returning user. A static `@noble` import anywhere in
+  the browser graph would fetch them at module-eval, before first paint;
+  `src/browser-e2e.js` asserts the first fetch lands at or after FCP.
+- **libsodium is injected, not statically loaded.** The vendored wrapper
+  scripts (`libsodium.js` + `libsodium-wrappers.js`, ~192 KB brotli transfer
+  incl. the inline WASM) are no longer `<script defer>` tags in the HTML;
+  `public/browser-crypto.js` injects them on first `init()` — the idle-time
+  bootstrap — so they too stay out of the initial parse. The browser E2E
+  asserts the first libsodium fetch lands at or after first paint, same as the
+  PQ graph.
+- **Returning users register without loading the PQ graph.** The self-signed
+  prekey bundle is static per identity (public material) and cached in
+  localStorage (`e2ee_bundle_v6` / `messenger_bundle_v6`), so re-publishing on
+  reload needs no ML-DSA-65. With a full one-time-prekey pool, a returning
+  user's reload bootstrap fetches **zero** @noble modules until a session
+  message is actually sent — the browser E2E asserts both halves of that
+  (nothing before the send, something after).
+- **The E2EE bootstrap runs on idle time.** libsodium ready-wait, identity
+  keygen/restore, and the relay connect are scheduled via `requestIdleCallback`
+  (5 s timeout fallback) in both `public/index.html` and `public/messenger.html`;
+  the send/open/copy paths await readiness (`whenE2EEReady()`), so the page
+  paints and is interactive before the identity exists — both browser tests
+  assert paint precedes identity creation.
+- **Vault-at-rest code is lazy too.** age-encryption and its @noble deps load
+  only when the Vault panel is first used (see the vault section above); a
+  page that never opens the Vault never fetches them.
 
 ## Limitations
 
@@ -318,12 +408,13 @@ prototype.
    over the same core and relay.
 
 4. **The key directory is availability-trusted, not identity-trusted.** Address
-   mode fetches the bundle + a one-time prekey from the relay's directory; the
-   client re-verifies the bundle and that its derived address matches, and the
-   relay enforces proof-of-possession at registration, so a malicious relay
-   cannot substitute a different identity. It *can* withhold, replay, or
-   exhaust one-time prekeys (denial-of-delivery) — the same trust you already
-   place in the relay to deliver ciphertext.
+   mode fetches the WHOLE shard containing the peer and selects the target
+   client-side; the client re-verifies the bundle and that its derived address
+   matches, and the relay enforces proof-of-possession at registration, so a
+   malicious relay cannot substitute a different identity. It *can* withhold or
+   replay shards, or omit a peer's prekeys (denial-of-delivery) — the same trust
+   you already place in the relay to deliver ciphertext. k-anonymity equals the
+   shard's population, so a small directory still has weak anonymity.
 
 5. **Bootstrap crash recovery is closed via delivery receipts.** The receiver
    auto-acks every first message it establishes from with an encrypted delivery
@@ -345,7 +436,12 @@ prototype.
 | PQ-protected session bootstrap (prekey bundles + one-time prekeys) | Done |
 | Ciphertext-only relay | Done |
 | Key directory (address mode, proof-of-possession) | Done |
+| Private directory lookup (whole-shard fetch, `fetch-shard`) | Done |
 | Authenticated registration (bound addresses) | Done |
 | Auto-Tor routing (CLI) | Done, fails closed |
+| Browser Tor routing (shell, `npm run messenger-tor`) | Done, fails closed |
 | Test messaging app (`public/messenger.html`) | Done |
+| Relay-side message mixing (batching, `MIX_OFF` opt-out) | Done |
+| TLS on the client↔relay link (default-on, `TLS_OFF` opt-out, fingerprint-pinned) | Done |
+| Metadata retention: memory-only, TTL, no per-identity logs | Done |
 | Metadata resistance (mixnet) | Not started |
