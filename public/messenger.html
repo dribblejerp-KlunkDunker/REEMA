@@ -137,6 +137,7 @@ import { analyzeMessage, shouldShare } from './aegis/verdad-service.js';
 import { AegisCrypto } from './aegis/crypto.js';
 import { signKeyBinding, verifyKeyBinding } from './aegis/keybinding.js';
 import { recordAttempt, CONTEXTS } from './aegis/attempts.js';
+import { bootTiming, createBootGate, deferBoot } from './boot-probe.js';
 
 const OTK_POOL_SIZE = 20;
 const IDENTITY_KEY = 'messenger_identity';
@@ -147,42 +148,18 @@ const AEGIS_BINDING_KEY = 'aegis_binding';
 const AEGIS_REBUTTAL = 'PrebunkRebuttal';
 
 // ---- Bootstrap timing probe (messenger smoke test) ----
-// Records when the page first paints (FCP, with a first-rAF fallback) and
-// when the E2EE identity first exists, so src/messenger-smoke.js can assert
-// the idle-deferred bootstrap never blocks first paint: identity creation
-// must not precede first paint. Mirrored to localStorage because the smoke
-// test's page.evaluate runs in an isolated world — same-origin storage is
-// shared, the window global is not. Harmless in production.
-window.__e2eeBootstrapTiming = { fcpMs: null, identityMs: null };
-const storeTiming = () => {
-  try { localStorage.setItem('__e2ee_timing', JSON.stringify(window.__e2eeBootstrapTiming)); } catch { /* private mode */ }
-};
-try {
-  new PerformanceObserver((list) => {
-    for (const entry of list.getEntries()) {
-      if (entry.name === 'first-contentful-paint' && window.__e2eeBootstrapTiming.fcpMs === null) {
-        window.__e2eeBootstrapTiming.fcpMs = entry.startTime;
-        storeTiming();
-      }
-    }
-  }).observe({ type: 'paint', buffered: true });
-} catch { /* engines without PerformanceObserver: fall back to first rAF */ }
-if (window.__e2eeBootstrapTiming.fcpMs === null) {
-  const markPaint = () => {
-    if (window.__e2eeBootstrapTiming.fcpMs === null) {
-      window.__e2eeBootstrapTiming.fcpMs = performance.now();
-      storeTiming();
-    }
-  };
-  requestAnimationFrame(markPaint);
-  addEventListener('load', markPaint);
-}
-const markIdentityExists = () => {
-  if (window.__e2eeBootstrapTiming.identityMs === null) {
-    window.__e2eeBootstrapTiming.identityMs = performance.now();
-    storeTiming();
-  }
-};
+// Shared with index.html via public/boot-probe.js: records FCP (with a
+// first-rAF fallback), when the E2EE identity first exists, and when the
+// FIRST @noble/post-quantum module and FIRST vendored libsodium script are
+// fetched (the same lazy-load lock-in the dashboard guards), so
+// src/messenger-smoke.js can assert the idle-deferred bootstrap never blocks
+// first paint.
+const { markIdentityExists } = bootTiming({
+  resourceMarkers: [
+    { field: 'firstNobleMs', namePart: '/@noble/' },
+    { field: 'firstSodiumMs', namePart: '/libsodium/' },
+  ],
+});
 
 let sodium, myId, ws = null;
 let myPk = '', myAddress = '';
@@ -856,19 +833,13 @@ async function onMessage(msg) {
 // The heavy E2EE bootstrap (libsodium ready-wait + WASM, identity load/keygen,
 // relay connect) is scheduled on idle time so first paint and interactivity
 // are not blocked; the send/open/copy paths await it through whenE2EEReady().
-let e2eeReady = null;
-function ensureE2EE() {
-  if (!e2eeReady) e2eeReady = main().catch((err) => { e2eeReady = null; throw err; });
-  return e2eeReady;
-}
-async function whenE2EEReady() {
-  try { await ensureE2EE(); return true; }
-  catch (err) {
+const { ensure: ensureE2EE, whenReady: whenE2EEReady } = createBootGate(
+  main,
+  (err) => {
     setStatus(false, 'init failed: ' + err.message);
     console.error(err);
-    return false;
-  }
-}
+  },
+);
 
 // Cheap UI wiring runs immediately; everything that needs sodium/identity
 // (address display, connect, send, copy) is gated on readiness above.
@@ -940,11 +911,7 @@ async function main() {
 wireUI();
 // Defer the bootstrap to idle time; the timeout guarantees it still runs on
 // busy pages, and the send/open/copy paths await it via whenE2EEReady().
-if (typeof requestIdleCallback === 'function') {
-  requestIdleCallback(() => { ensureE2EE().catch(console.error); }, { timeout: 5000 });
-} else {
-  setTimeout(() => { ensureE2EE().catch(console.error); }, 0);
-}
+deferBoot(ensureE2EE);
 </script>
 </body>
 </html>

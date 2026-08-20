@@ -104,6 +104,24 @@ try {
     probeOk ? `FCP ${timing.fcpMs.toFixed(1)}ms, identity ${timing.identityMs.toFixed(1)}ms`
             : timing ? `probe incomplete (fcp=${timing.fcpMs}, identity=${timing.identityMs})` : 'probe missing');
 
+  // Lazy-load lock-in (same as the dashboard): the first @noble/post-quantum
+  // fetch must land at/after first paint — the modules are pulled by the
+  // deferred bootstrap's crypto work, never during initial module evaluation.
+  // A static @noble import would fetch before FCP and fail this.
+  const lazyOk = !!timing && timing.firstNobleMs !== null && timing.fcpMs !== null;
+  check('messenger fetched no @noble/post-quantum modules during the initial load (lazy-load win)',
+    lazyOk && timing.firstNobleMs >= timing.fcpMs,
+    lazyOk ? `first @noble fetch ${timing.firstNobleMs.toFixed(1)}ms (FCP ${timing.fcpMs.toFixed(1)}ms)`
+           : timing ? `probe incomplete (fcp=${timing.fcpMs}, firstNoble=${timing.firstNobleMs})` : 'probe missing');
+
+  // Same lazy treatment for libsodium: it is injected by browser-crypto.js on
+  // the idle bootstrap, so its first fetch must also land at/after FCP.
+  const sodiumOk = !!timing && timing.firstSodiumMs !== null && timing.fcpMs !== null;
+  check('messenger vendored libsodium (WASM) not fetched during the initial parse (lazy-load win)',
+    sodiumOk && timing.firstSodiumMs >= timing.fcpMs,
+    sodiumOk ? `first libsodium fetch ${timing.firstSodiumMs.toFixed(1)}ms (FCP ${timing.fcpMs.toFixed(1)}ms)`
+             : timing ? `probe incomplete (fcp=${timing.fcpMs}, firstSodium=${timing.firstSodiumMs})` : 'probe missing');
+
   const addrA = await A.evaluate(() => document.getElementById('my-address').textContent);
   check('A has a 44-char bound routing address', addrA.length === 44, addrA);
 

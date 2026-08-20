@@ -1496,8 +1496,14 @@ footer p{font-family:'Cinzel',serif;font-size:10px;letter-spacing:.3em;color:var
             <div class="did-key-box" id="my-pq-key" style="cursor:pointer;font-size:10px;" title="Click to copy">Loading...</div>
           </div>
 
+          <div style="margin-bottom:8px">
+            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:4px">ROUTING ADDRESS (44-char b64 — peers paste this to reach you)</div>
+            <div class="did-key-box" id="my-address-key" style="cursor:pointer;font-size:10px;" title="Click to copy">Loading...</div>
+          </div>
+
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px">
             <span id="relay-status" style="font-family:'Cinzel',serif;font-size:10px;color:var(--amber)">🟡 RELAY CONNECTING...</span>
+            <span id="memory-status" style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim)">🧠 MEMORY …</span>
             <div style="display:flex;gap:8px">
               <button type="button" class="cs-btn" onclick="shareMyKey()">🔗 SHARE KEY</button>
               <button type="button" class="analyze-btn" onclick="rotateIdentity()">🔄 ROTATE</button>
@@ -1539,7 +1545,22 @@ footer p{font-family:'Cinzel',serif;font-size:10px;letter-spacing:.3em;color:var
             <div class="did-key-box" id="vault-age-recipient" style="cursor:pointer;font-size:10px;margin-top:6px" title="Click to copy" onclick="navigator.clipboard.writeText(this.dataset.full || this.innerText); showToast('Age Recipient Copied')">—</div>
           </div>
           <div style="flex:1;min-width:280px">
-            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:6px">2 · ENCRYPT IDENTITY BACKUP</div>
+            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:6px">2 · ENCRYPT BACKUP</div>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+              <span style="font-family:'Cinzel',serif;font-size:9px;color:var(--text-dim);letter-spacing:.1em">BACK UP:</span>
+              <select id="vault-scope" onchange="vaultScopeChanged()" style="background:#0d0b10;color:var(--text);border:1px solid var(--rule);border-radius:4px;font-size:10px;padding:3px 6px">
+                <option value="identity" selected>Identity (all 8 keypairs + OTK pool)</option>
+                <option value="session">Active session (ratchet state)</option>
+                <option value="note">Note (arbitrary text)</option>
+              </select>
+              <span id="vault-session-target" style="display:none;font-family:'Cormorant Garamond',serif;font-style:italic;font-size:11px;color:var(--text-dim)"></span>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+              <span style="font-family:'Cinzel',serif;font-size:9px;color:var(--text-dim);letter-spacing:.1em">TO:</span>
+              <input type="text" id="vault-recipient-input" class="osint-input" oninput="vaultRecipientChanged()" placeholder="Paste any age recipient (age1... / age1pq1...) — defaults to the generated keypair" style="flex:1;min-width:170px;font-size:10px">
+              <span id="vault-recipient-tag" style="display:none;font-family:'Cormorant Garamond',serif;font-style:italic;font-size:11px;color:var(--text-dim)"></span>
+            </div>
+            <textarea id="vault-note-input" class="osint-input" style="display:none;width:100%;height:52px;margin-bottom:6px;font-size:10px;resize:vertical" placeholder="Type the note to encrypt at rest..."></textarea>
             <input type="password" id="vault-passphrase" class="osint-input" placeholder="Optional passphrase (scrypt) — or rely on the keypair" style="width:100%;margin-bottom:6px">
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button type="button" class="cs-btn" onclick="vaultExport()">🔐 EXPORT VAULT</button>
@@ -1549,16 +1570,38 @@ footer p{font-family:'Cinzel',serif;font-size:10px;letter-spacing:.3em;color:var
             <textarea id="vault-export-out" class="osint-input" readonly style="width:100%;height:110px;margin-top:8px;font-family:monospace;font-size:10px;resize:vertical" placeholder="Armored vault will appear here..."></textarea>
           </div>
           <div style="flex:1;min-width:280px">
-            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:6px">3 · DECRYPT &amp; RESTORE IDENTITY</div>
+            <div style="font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);margin-bottom:6px">3 · DECRYPT &amp; RESTORE</div>
             <textarea id="vault-import-in" class="osint-input" style="width:100%;height:64px;font-family:monospace;font-size:10px;resize:vertical" placeholder="Paste an armored age vault..."></textarea>
-            <input type="password" id="vault-import-key" class="osint-input" placeholder="AGE-SECRET-KEY-1... (or use a passphrase below)" style="width:100%;margin-top:6px;font-size:10px">
+            <input type="password" id="vault-import-key" class="osint-input" placeholder="AGE-SECRET-KEY-1... / AGE-SECRET-KEY-PQ-1... (or use a passphrase below)" style="width:100%;margin-top:6px;font-size:10px">
             <input type="password" id="vault-import-passphrase" class="osint-input" placeholder="...or the vault passphrase" style="width:100%;margin-top:6px">
-            <button type="button" class="analyze-btn" style="margin-top:8px" onclick="vaultImport()">♻️ DECRYPT &amp; RESTORE IDENTITY</button>
+            <button type="button" class="analyze-btn" style="margin-top:8px" onclick="vaultImport()">♻️ DECRYPT &amp; RESTORE</button>
           </div>
         </div>
       </div>
 
-
+      <!-- Group Channels (ROADMAP §7 prototype) -->
+      <div id="group-panel" style="margin-top:14px;padding:12px 14px;background:var(--granite-surface);border:1px solid var(--rule);border-radius:3px">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+          <span style="font-family:'Cinzel',serif;font-size:9px;color:var(--text-dim);letter-spacing:.15em">GROUP CHANNELS:</span>
+          <div id="group-tabs" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+          <span id="no-groups-label" style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:12px;color:var(--text-dim)">no groups yet — create one or paste a Welcome to join</span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input type="text" id="group-label-input" class="osint-input" placeholder="group label" style="flex:1;min-width:120px;font-size:10px">
+          <input type="text" id="group-members-input" class="osint-input" placeholder="members (optional, comma-separated addresses)" style="flex:1;min-width:200px;font-size:10px">
+          <button type="button" class="cs-btn" onclick="uiCreateGroup()">＋ NEW GROUP</button>
+          <input type="text" id="group-welcome-input" class="osint-input" placeholder="or paste a group Welcome JSON to join" style="flex:1;min-width:220px;font-size:10px">
+          <button type="button" class="fi-btn" onclick="uiJoinGroup()">JOIN</button>
+          <button type="button" class="fi-btn" style="border-color:var(--bronze-mid);color:var(--bronze-sheen)" id="group-copy-welcome-btn" disabled onclick="uiCopyWelcome()">COPY WELCOME</button>
+        </div>
+        <div style="display:none;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap" id="group-welcome-row">
+          <span style="font-family:'Cinzel',serif;font-size:9px;color:var(--text-dim);letter-spacing:.1em">INVITE:</span>
+          <input type="text" id="group-welcome-out" class="osint-input" readonly placeholder="This group's Welcome — send it to someone to join" style="flex:1;min-width:240px;font-size:10px">
+        </div>
+        <div style="margin-top:6px;font-family:'Cormorant Garamond',serif;font-style:italic;font-size:11px;color:var(--text-dim)">
+          Prototype (ROADMAP §7): epoch-key group chat — a group is just an address to the relay, which fans out opaque envelopes to subscribers. Joining is out-of-band for now (Welcome via clipboard).
+        </div>
+      </div>
 
       <!-- Session Tabs -->
       <div id="session-tabs-bar" style="display:flex;gap:6px;margin-top:14px;flex-wrap:wrap;align-items:center">
@@ -3345,96 +3388,53 @@ function exportJSONLD() {
 }
 </script>
 <script type="module">
-  import { init, Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, RECEIPT, isReceipt } from './browser-crypto.js';
+  import { init, Identity, Session, signingPayload, encodeBundle, decodeBundle, loadPQ, RECEIPT, isReceipt, directoryShard, selectOneTimePrekey } from './browser-crypto.js';
+  import { createMemory } from './memory.js';
+  import { shortKey } from './sanitize.js';
+  import { GroupSession, useSodium } from './group-core.js';
+  import { bootTiming, createBootGate, deferBoot } from './boot-probe.js';
 
   let myId;
   let sodium;
   let ws = null;
   let myPk = '';
-  let myAddress = '';
-  let pendingDirectoryResolve = null; // resolver for a fetch-directory response
+  let myAddress = '';   let pendingDirectoryResolve = null; // resolver for a directory-shard response
   const OTK_POOL_SIZE = 20;
 
   // ---- Bootstrap timing probe (browser E2E) ----
-  // Records when the page first paints (FCP, with a first-rAF fallback) and
-  // when the E2EE identity first exists, so src/browser-e2e.js can assert the
-  // idle-deferred bootstrap never blocks first paint: identity creation must
-  // not precede first paint. The values are mirrored to localStorage because
-  // the E2E's page.evaluate runs in an isolated world — same-origin storage
-  // is shared, the window global is not. Harmless in production; if the probe
-  // is ever removed, the E2E check fails loudly.
-  window.__e2eeBootstrapTiming = { fcpMs: null, identityMs: null, firstNobleMs: null, firstSodiumMs: null };
-  const storeTiming = () => {
-    try { localStorage.setItem('__e2ee_timing', JSON.stringify(window.__e2eeBootstrapTiming)); } catch { /* private mode */ }
-  };
-  try {
-    new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        if (entry.name === 'first-contentful-paint' && window.__e2eeBootstrapTiming.fcpMs === null) {
-          window.__e2eeBootstrapTiming.fcpMs = entry.startTime;
-          storeTiming();
-        }
-      }
-    }).observe({ type: 'paint', buffered: true });
-  } catch { /* engines without PerformanceObserver: fall back to first rAF */ }
-  // Lazy-load lock-in: record when the FIRST @noble/post-quantum module and
-  // the FIRST vendored libsodium script are fetched (resource timing covers
-  // cache hits too, so a browser-cached fetch still counts). If a static
-  // import or <script> tag ever re-enters the initial page, the fetch would
-  // start at module-eval — before first paint — and the browser E2E fails.
-  try {
-    new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        const t = window.__e2eeBootstrapTiming;
-        if (entry.name.includes('/@noble/') && t.firstNobleMs === null) {
-          t.firstNobleMs = entry.startTime;
-          storeTiming();
-        } else if (entry.name.includes('/libsodium/') && t.firstSodiumMs === null) {
-          t.firstSodiumMs = entry.startTime;
-          storeTiming();
-        }
-      }
-    }).observe({ type: 'resource', buffered: true });
-  } catch { /* no resource timing: markers stay null and the E2E fails loudly */ }
-  if (window.__e2eeBootstrapTiming.fcpMs === null) {
-    const markPaint = () => {
-      if (window.__e2eeBootstrapTiming.fcpMs === null) {
-        window.__e2eeBootstrapTiming.fcpMs = performance.now();
-        storeTiming();
-      }
-    };
-    requestAnimationFrame(markPaint);
-    addEventListener('load', markPaint);
-  }
-  const markIdentityExists = () => {
-    if (window.__e2eeBootstrapTiming.identityMs === null) {
-      window.__e2eeBootstrapTiming.identityMs = performance.now();
-      storeTiming();
-    }
-  };
+  // Shared with messenger.html via public/boot-probe.js. Records FCP (with a
+  // first-rAF fallback), when the E2EE identity first exists, and when the
+  // FIRST @noble/post-quantum module and FIRST vendored libsodium script are
+  // fetched (the lazy-load lock-in). Mirrored to localStorage so the E2E's
+  // isolated-world evaluate() can read it; harmless in production.
+  const { markIdentityExists } = bootTiming({
+    resourceMarkers: [
+      { field: 'firstNobleMs', namePart: '/@noble/' },
+      { field: 'firstSodiumMs', namePart: '/libsodium/' },
+    ],
+  });
 
   // Multi-session state
   // sessions: Map<peerPkB64, { session: Session, messages: number, epoch: number, lastEnvSize: number }>
   const sessions = new Map();
   let activePeerPk = null; // currently viewed session's peer pk
+  // Group channels (ROADMAP §7 prototype): a group is a GroupSession keyed by
+  // its group_id — the same 44-char routing address the relay fans out to.
+  // groups: Map<groupId, { session: GroupSession, feedEl, messages, lastEnvSize }>
+  const groups = new Map();
+  let activeGroupId = null; // currently viewed group channel
 
   // ---- Deferred E2EE bootstrap ----
   // startE2EE() is expensive (libsodium ready-wait, ML-KEM/ML-DSA keygen,
   // relay connect), so it is scheduled on requestIdleCallback and the
   // send/open paths await it instead of blocking first paint.
-  let e2eeReady = null;
-  function ensureE2EE() {
-    if (!e2eeReady) e2eeReady = startE2EE().catch((err) => { e2eeReady = null; throw err; });
-    return e2eeReady;
-  }
-  async function whenE2EEReady() {
-    try { await ensureE2EE(); return true; }
-    catch (err) {
+  const { ensure: ensureE2EE, whenReady: whenE2EEReady } = createBootGate(
+    startE2EE,
+    (err) => {
       console.error('[E2EE] bootstrap failed:', err);
       showToast('⚠️ Crypto bootstrap failed — ' + err.message);
-      return false;
-    }
-  }
+    },
+  );
 
   // ---- Identity management ----
 
@@ -3493,9 +3493,6 @@ function exportJSONLD() {
     markIdentityExists();
   }
 
-
-  // Authenticated registration: publish the identity-bound address, the
-  // self-signed bundle (proof-of-possession) and the one-time prekey pool.
   // The shareable prekey bundle is static per identity (public key material
   // plus a self-signature over it), so it is cached in localStorage after the
   // first publish. Re-publishing a returning user's cached bundle needs no
@@ -3536,16 +3533,29 @@ function exportJSONLD() {
     ws.send(JSON.stringify({
       type: 'publish',
       address: myAddress,
-      bundle: myId.makeBundle(),
+      bundle,
       oneTimePrekeys: otks,
     }));
   }
 
-  function fetchDirectory(address) {
-    return new Promise((resolve, reject) => {
+  async function fetchDirectory(address) {
+    // Private directory lookup (ANONYMITY.md Phase 1): fetch the WHOLE shard,
+    // so the relay only learns "fetched shard #k" — never which address.
+    const msg = await new Promise((resolve, reject) => {
       pendingDirectoryResolve = { resolve, reject };
-      ws.send(JSON.stringify({ type: 'fetch-directory', address }));
+      ws.send(JSON.stringify({ type: 'fetch-shard', shard: directoryShard(address, 1) }));
     });
+    const entry = (msg.entries || []).find((e) => e.address === address);
+    if (!entry) throw new Error('address not in shard (peer not registered)');
+    const peer = Identity.verifyBundle(entry.bundle);
+    if (sodium.to_base64(Identity.deriveAddress(peer.signPk, peer.staticDhPk), sodium.base64_variants.ORIGINAL) !== address) {
+      throw new Error('shard entry does not match its bundle (tampered relay)');
+    }
+    const oneTimePrekey = selectOneTimePrekey(myAddress, address, entry.oneTimePrekeys || []);
+    if (oneTimePrekey && !Identity.verifyOneTimePrekey(peer.signPk, oneTimePrekey)) {
+      throw new Error('shard served a one-time prekey not signed by the peer');
+    }
+    return { bundle: entry.bundle, oneTimePrekey };
   }
 
   window.generateNewE2EEIdentity = async function() {
@@ -3560,8 +3570,13 @@ function exportJSONLD() {
     sessions.clear();
     localStorage.removeItem('e2ee_sessions');
     localStorage.removeItem('e2ee_active_peer');
+    // A fresh identity is a fresh member — group memberships do not carry over.
+    groups.clear();
+    localStorage.removeItem('e2ee_groups');
+    activeGroupId = null;
     activePeerPk = null;
     renderAllSessionTabs();
+    renderAllGroupTabs();
     document.getElementById('chat-feed').innerHTML = '<div id="chat-empty" style="text-align:center;font-family:\'Cormorant Garamond\',serif;font-style:italic;color:var(--text-dim);margin-top:40px;">Session reset. New identity active.</div>';
     document.getElementById('session-info-bar').style.display = 'none';
     await publishToRelay();
@@ -3573,6 +3588,14 @@ function exportJSONLD() {
     const el = document.getElementById('my-x25519-key');
     el.dataset.full = myPk;
     el.innerText = myPk.slice(0, 24) + '...' + myPk.slice(-8);
+    // The user's own routing address (44-char b64) — the value peers paste
+    // into the group members field or pair flow. Click to copy.
+    const addrEl = document.getElementById('my-address-key');
+    if (addrEl) {
+      addrEl.dataset.full = myAddress;
+      addrEl.innerText = myAddress;
+      addrEl.onclick = () => { navigator.clipboard.writeText(myAddress); showToast('Routing Address Copied'); };
+    }
 
     const signPkB64 = sodium.to_base64(myId.signPk, sodium.base64_variants.ORIGINAL);
     const pqEl = document.getElementById('my-pq-key');
@@ -3616,6 +3639,48 @@ function exportJSONLD() {
   }
   let vaultIdentity = null; // age keypair, held in memory for this session only
 
+  // The BACK UP selector chooses what gets encrypted: the identity JSON,
+  // the active session's ratchet state, or an arbitrary note. Toggle the
+  // per-scope inputs and show which session would be backed up.
+  window.vaultScopeChanged = function() {
+    const scope = document.getElementById('vault-scope').value;
+    document.getElementById('vault-note-input').style.display = scope === 'note' ? '' : 'none';
+    const target = document.getElementById('vault-session-target');
+    target.style.display = scope === 'session' ? '' : 'none';
+    if (scope === 'session') {
+      target.textContent = (activePeerPk && sessions.has(activePeerPk))
+        ? '→ active: ' + activePeerPk.slice(0, 16) + '…'
+        : 'no active session yet';
+    }
+  };
+
+  // A pasted recipient (age1... / age1pq1...) wins over the generated
+  // keypair, so the panel can encrypt to ANYONE's public key — the standard
+  // age flow. Tag the target so the user sees whether the file will carry the
+  // PQ-hybrid mlkem768x25519 stanza (needs age v1.2.0+ tooling to open).
+  window.vaultRecipientChanged = function() {
+    const tag = document.getElementById('vault-recipient-tag');
+    const r = document.getElementById('vault-recipient-input').value.trim();
+    // Same shape check as the export guard: age1 + 50+ bech32 chars, or the
+    // PQ-hybrid age1pq1 variant.
+    const valid = /^age1(?:pq1)?[a-z0-9]{50,}$/.test(r);
+    if (r.startsWith('age1pq1') && valid) {
+      tag.style.display = '';
+      tag.style.color = 'var(--bronze-sheen)';
+      tag.textContent = 'PQ hybrid (X25519 + ML-KEM-768) — needs age v1.2.0+';
+    } else if (valid) {
+      tag.style.display = '';
+      tag.style.color = 'var(--text-dim)';
+      tag.textContent = 'X25519 recipient';
+    } else if (r) {
+      tag.style.display = '';
+      tag.style.color = 'var(--crim)';
+      tag.textContent = 'not an age1... recipient';
+    } else {
+      tag.style.display = 'none';
+    }
+  };
+
   window.vaultKeygen = async function() {
     try {
       const hybrid = document.getElementById('vault-hybrid').checked;
@@ -3638,21 +3703,63 @@ function exportJSONLD() {
   window.vaultExport = async function() {
     if (!(await whenE2EEReady())) return;
     const passphrase = document.getElementById('vault-passphrase').value;
-    if (!vaultIdentity && !passphrase) {
-      showToast('Generate an age keypair or set a passphrase first');
+    // A recipient pasted in the TO: field wins over the generated keypair;
+    // either one (or a passphrase) is enough to encrypt.
+    const recipient = document.getElementById('vault-recipient-input').value.trim()
+      || (vaultIdentity ? vaultIdentity.recipient : '');
+    if (!recipient && !passphrase) {
+      showToast('Generate an age keypair, paste a recipient, or set a passphrase first');
+      return;
+    }
+    if (recipient && !/^age1(?:pq1)?[a-z0-9]{50,}$/.test(recipient)) {
+      showToast('⚠️ "' + recipient.slice(0, 16) + '…" is not a valid age recipient (age1... / age1pq1...)');
       return;
     }
     try {
       const { exportVault } = await vaultCore();
-      // The vault payload is the SAME v6 identity JSON that persistIdentity
-      // writes to localStorage — so a vault restores the messenger identity
-      // exactly, one-time prekey pool included.
-      const armored = await exportVault(JSON.stringify(identityToJSON()), {
-        recipient: vaultIdentity ? vaultIdentity.recipient : undefined,
+      // What gets encrypted depends on the BACK UP scope:
+      //   identity — the exact v6 identity JSON persistIdentity writes (all 8
+      //             keypairs + OTK pool); raw JSON for backward compatibility;
+      //   session  — the ACTIVE session's full ratchet state (Session.serialize),
+      //             so a re-imported session keeps decrypting the peer's chain;
+      //   note     — arbitrary text, encrypted at rest.
+      // Sessions and notes ride a tiny typed envelope {kind, v, data} so
+      // import can route them; identity vaults stay unchanged.
+      const scope = document.getElementById('vault-scope').value;
+      let payload;
+      let what;
+      if (scope === 'session') {
+        const meta = sessions.get(activePeerPk);
+        if (!meta) { showToast('No active session to back up — open or send to a peer first'); return; }
+        payload = JSON.stringify({
+          kind: 'session', v: 1,
+          data: {
+            peerPkB64: activePeerPk,
+            messages: meta.messages,
+            lastEnvSize: meta.lastEnvSize,
+            session: meta.session.serialize(),
+          },
+        });
+        what = 'session with ' + activePeerPk.slice(0, 12) + '…';
+      } else if (scope === 'note') {
+        const note = document.getElementById('vault-note-input').value;
+        if (!note.trim()) { showToast('Type a note first'); return; }
+        payload = JSON.stringify({ kind: 'note', v: 1, data: note });
+        what = 'note';
+      } else {
+        payload = JSON.stringify(identityToJSON());
+        what = 'identity';
+      }
+      const armored = await exportVault(payload, {
+        recipient: recipient || undefined,
         passphrase: passphrase || undefined,
       });
       document.getElementById('vault-export-out').value = armored;
-      showToast('🔐 Identity encrypted to an age vault (' + armored.length + ' chars)');
+      if (recipient) {
+        showToast('🔐 ' + what + ' encrypted to ' + (recipient.startsWith('age1pq1') ? 'PQ hybrid ' : '') + recipient.slice(0, 12) + '… (' + armored.length + ' chars)');
+      } else {
+        showToast('🔐 ' + what + ' encrypted to an age vault (passphrase, ' + armored.length + ' chars)');
+      }
     } catch (err) {
       console.error('[vault] export failed:', err);
       showToast('⚠️ Export failed — ' + err.message);
@@ -3698,31 +3805,66 @@ function exportJSONLD() {
       return;
     }
     let data;
-    try { data = JSON.parse(plain); } catch { showToast('⚠️ Vault is not a BlackVault identity backup'); return; }
+    try { data = JSON.parse(plain); } catch { showToast('⚠️ Vault is not a BlackVault backup'); return; }
     const needs = ['signSk', 'signPk', 'dhSk', 'dhPk', 'signedDhSk', 'signedDhPk', 'kemSk', 'kemPk'];
-    if (!(data && data.v === 6 && needs.every((f) => typeof data[f] === 'string'))) {
-      showToast('⚠️ Vault is not a BlackVault v6 identity backup');
+    if (data && data.v === 6 && needs.every((f) => typeof data[f] === 'string')) {
+      // Identity vault (raw v6 identity JSON — also the legacy format):
+      // restore the messenger identity exactly, OTK pool included.
+      try {
+        await restoreIdentityFromData(data);
+        persistIdentity();
+        sessions.clear();
+        localStorage.removeItem('e2ee_sessions');
+        localStorage.removeItem('e2ee_active_peer');
+        // Restored identity = restored membership; groups do not carry over.
+        groups.clear();
+        localStorage.removeItem('e2ee_groups');
+        activeGroupId = null;
+        activePeerPk = null;
+        renderAllSessionTabs();
+        renderAllGroupTabs();
+        document.getElementById('chat-feed').innerHTML = '<div id="chat-empty" style="text-align:center;font-family:\'Cormorant Garamond\',serif;font-style:italic;color:var(--text-dim);margin-top:40px;">Identity restored from vault. New identity active.</div>';
+        document.getElementById('session-info-bar').style.display = 'none';
+        await publishToRelay();
+        showToast('♻️ Identity restored from vault — re-published to the relay');
+      } catch (err) {
+        console.error('[vault] restore failed:', err);
+        showToast('⚠️ Restore failed — ' + err.message);
+      }
       return;
     }
-    try {
-      await restoreIdentityFromData(data);
-      persistIdentity();
-      sessions.clear();
-      localStorage.removeItem('e2ee_sessions');
-      localStorage.removeItem('e2ee_active_peer');
-      activePeerPk = null;
-      renderAllSessionTabs();
-      document.getElementById('chat-feed').innerHTML = '<div id="chat-empty" style="text-align:center;font-family:\'Cormorant Garamond\',serif;font-style:italic;color:var(--text-dim);margin-top:40px;">Identity restored from vault. New identity active.</div>';
-      document.getElementById('session-info-bar').style.display = 'none';
-      await publishToRelay();
-      showToast('♻️ Identity restored from vault — re-published to the relay');
-    } catch (err) {
-      console.error('[vault] restore failed:', err);
-      showToast('⚠️ Restore failed — ' + err.message);
+    if (data && data.kind === 'session' && data.v === 1 && data.data && data.data.session) {
+      // Session vault: restore the peer's ratchet state into the sessions map.
+      try {
+        const meta = data.data;
+        const session = Session.restore(myId, meta.session);
+        if (sodium.to_base64(session.peerDhPk, sodium.base64_variants.ORIGINAL) !== meta.peerPkB64) {
+          showToast('⚠️ Session vault peer mismatch (different identity?)');
+          return;
+        }
+        sessions.set(meta.peerPkB64, {
+          session,
+          messages: meta.messages || 0,
+          epoch: 0,
+          lastEnvSize: meta.lastEnvSize || 0,
+        });
+        saveSessionsToStorage();
+        renderAllSessionTabs();
+        switchSession(meta.peerPkB64);
+        showToast('♻️ Session restored — continue chatting with this peer');
+      } catch (err) {
+        console.error('[vault] session restore failed:', err);
+        showToast('⚠️ Session restore failed — ' + err.message);
+      }
+      return;
     }
+    if (data && data.kind === 'note' && data.v === 1) {
+      document.getElementById('vault-export-out').value = String(data.data);
+      showToast('📄 Note decrypted — shown in the export box');
+      return;
+    }
+    showToast('⚠️ Vault is not a recognized BlackVault backup');
   };
-
-
 
   // ---- Session management ----
 
@@ -3748,6 +3890,7 @@ function exportJSONLD() {
   window.openSession = async function() {
     const raw = document.getElementById('peer-key-input').value.trim();
     if (!raw) { showToast('Enter a peer prekey bundle or address first'); return; }
+    if (!(await whenE2EEReady())) return;
     await loadPQ(); // canonicalPeerBundle verifies the bundle's ML-DSA-65 signature
 
     // Address mode: the session is established on first send (directory fetch).
@@ -3769,8 +3912,16 @@ function exportJSONLD() {
 
   function switchSession(peerPkB64) {
     activePeerPk = peerPkB64;
+    activeGroupId = null; // pair and group views are mutually exclusive
+    document.getElementById('group-copy-welcome-btn').disabled = true;
+    document.querySelectorAll('[data-group]').forEach((t) => {
+      t.style.borderColor = 'var(--rule)';
+      t.style.color = 'var(--text-dim)';
+    });
     try { localStorage.setItem('e2ee_active_peer', peerPkB64); } catch { /* storage blocked/full */ }
     document.getElementById('peer-key-input').value = peerPkB64;
+    document.getElementById('chat-input').placeholder = 'Type encrypted message... (Enter to send)';
+    document.getElementById('group-welcome-row').style.display = 'none';
     // Highlight active tab
     document.querySelectorAll('.session-tab').forEach(t => {
       t.style.borderColor = t.dataset.pk === peerPkB64 ? 'var(--bronze-sheen)' : 'var(--rule)';
@@ -3937,6 +4088,8 @@ function exportJSONLD() {
     document.getElementById('si-epoch').innerText = meta.session.PN || 0;
     document.getElementById('si-msgs').innerText = meta.messages;
     document.getElementById('si-size').innerText = meta.lastEnvSize > 0 ? meta.lastEnvSize.toLocaleString() : '-';
+    const tag = bar.querySelector('.rel-tag');
+    if (tag) tag.textContent = 'X25519 + ML-KEM-768 + ML-DSA-65';
   }
 
   // ---- Message rendering ----
@@ -3982,10 +4135,323 @@ function exportJSONLD() {
     }
   }
 
+  // ---- Client-side memory (loopback Hindsight sidecar) ----
+  // Same retain-on-send / retain+recall-on-receive semantics as the CLI client
+  // (src/client.js). All fire-and-forget; memory must never block the chat.
+  let memory = null;
+  let memoryEnabled = false;
+
+  /** bv-<sha256(myAddress) hex, first 16 chars> — matches the CLI derivation. */
+  async function memoryBankId() {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(myAddress));
+    const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    return `bv-${hex.slice(0, 16)}`;
+  }
+
+  async function initMemory() {
+    if (memoryEnabled || !myAddress) return;
+    // ?memory=0 disables; ?memory=http://127.0.0.1:PORT overrides the sidecar.
+    // Like the relay param, only loopback URLs are honored.
+    const memParam = new URLSearchParams(location.search).get('memory');
+    if (memParam === '0') return;
+    let baseUrl = 'http://127.0.0.1:8878';
+    if (memParam && /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(memParam)) {
+      baseUrl = memParam.replace(/\/+$/, '');
+    }
+    const mem = createMemory({
+      baseUrl,
+      bankId: await memoryBankId(),
+      logger: { warn: (...a) => console.warn(...a) },
+    });
+    const h = await mem.health();
+    const status = document.getElementById('memory-status');
+    if (!h.ok) {
+      console.warn('[memory] sidecar not reachable at', baseUrl, '— memory off');
+      if (status) { status.textContent = '🧠 MEMORY OFF'; status.style.color = 'var(--text-dim)'; }
+      return;
+    }
+    memory = mem;
+    memoryEnabled = true;
+    if (status) { status.textContent = `🧠 MEMORY ON · ${mem.bankId}`; status.style.color = 'var(--green)'; }
+    mem.ensureBank();
+  }
+
+  function renderMemoryHint(text, score, peerPkB64, groupId) {
+    const meta = groupId ? groups.get(groupId) : sessions.get(peerPkB64 || activePeerPk);
+    if (!meta || !meta.feedEl) return;
+    const div = document.createElement('div');
+    div.style.cssText = "font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);padding:2px 16px;border-left:2px solid var(--bronze-mid)";
+    div.innerText = `🧠 memory: ${text}${score != null ? ` (score ${score.toFixed(2)})` : ''}`;
+    meta.feedEl.appendChild(div);
+    const feed = document.getElementById('chat-feed');
+    if ((peerPkB64 || activePeerPk) === activePeerPk && feed.contains(meta.feedEl)) {
+      feed.scrollTop = feed.scrollHeight;
+    }
+  }
+
+  // ---- Group channels (ROADMAP §7 prototype) ----
+
+  /** Bind this client to a group_id so the relay fans group envelopes to us. */
+  function subscribeGroup(groupId) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'subscribe', group: groupId }));
+    }
+  }
+
+  /** Re-subscribe every known group (called on ws.onopen after a reload). */
+  function resubscribeAllGroups() {
+    for (const gid of groups.keys()) subscribeGroup(gid);
+  }
+
+  window.uiCreateGroup = async function() {
+    if (!(await whenE2EEReady())) return;
+    const label = document.getElementById('group-label-input').value.trim();
+    if (!label) { showToast('Enter a group label first'); return; }
+    // Optional invitee roster: comma-separated 44-char addresses. Only listed
+    // members can join the epoch-0 Welcome (fromWelcome enforces membership).
+    const members = document.getElementById('group-members-input').value
+      .split(',').map((s) => s.trim()).filter((s) => s.length === 44);
+    const g = GroupSession.create({
+      creatorAddress: myAddress,
+      label,
+      nonce: sodium.randombytes_buf(8),
+      members,
+      myAddress,
+    });
+    groups.set(g.groupId, { session: g, messages: 0, lastEnvSize: 0 });
+    subscribeGroup(g.groupId);
+    persistGroups();
+    renderAllGroupTabs();
+    switchGroup(g.groupId);
+    showGroupWelcome();
+    document.getElementById('group-label-input').value = '';
+    document.getElementById('group-members-input').value = '';
+    showToast('👥 Group created — ' + g.groupId.slice(0, 12) + '… (INVITE box holds the Welcome)');
+  };
+
+  window.uiJoinGroup = async function() {
+    if (!(await whenE2EEReady())) return;
+    const welcome = document.getElementById('group-welcome-input').value.trim();
+    if (!welcome) { showToast('Paste a group Welcome JSON to join'); return; }
+    let g;
+    try {
+      g = GroupSession.fromWelcome(welcome, myAddress);
+    } catch (err) {
+      showToast('⚠️ Not a valid Welcome for you — ' + err.message);
+      return;
+    }
+    if (groups.has(g.groupId)) { showToast('Already in that group'); return; }
+    groups.set(g.groupId, { session: g, messages: 0, lastEnvSize: 0 });
+    subscribeGroup(g.groupId);
+    persistGroups();
+    renderAllGroupTabs();
+    switchGroup(g.groupId);
+    showGroupWelcome();
+    document.getElementById('group-welcome-input').value = '';
+    showToast('👥 Joined group — ' + g.groupId.slice(0, 12) + '…');
+  };
+
+  /** Show the active group's Welcome so the creator can invite members. */
+  function showGroupWelcome() {
+    const row = document.getElementById('group-welcome-row');
+    const out = document.getElementById('group-welcome-out');
+    const g = groups.get(activeGroupId);
+    if (g) {
+      out.value = g.session.makeWelcome();
+      row.style.display = 'flex';
+    } else {
+      out.value = '';
+      row.style.display = 'none';
+    }
+  }
+
+  /** Copy this group's current Welcome (epoch key + membership) for a new member. */
+  window.uiCopyWelcome = function() {
+    const g = groups.get(activeGroupId);
+    if (!g) { showToast('Select a group first'); return; }
+    navigator.clipboard.writeText(g.session.makeWelcome());
+    showToast('📋 Welcome copied — a member can paste it into JOIN');
+  };
+
+  function renderAllGroupTabs() {
+    const container = document.getElementById('group-tabs');
+    const noLabel = document.getElementById('no-groups-label');
+    container.innerHTML = '';
+    if (groups.size === 0) {
+      noLabel.style.display = '';
+      document.getElementById('group-copy-welcome-btn').disabled = true;
+      return;
+    }
+    noLabel.style.display = 'none';
+    for (const [groupId] of groups) {
+      const tab = document.createElement('button');
+      tab.type = 'button';
+      tab.className = 'session-tab cs-btn';
+      tab.dataset.group = groupId;
+      tab.style.fontSize = '9px';
+      tab.style.padding = '3px 10px';
+      tab.style.borderColor = groupId === activeGroupId ? 'var(--bronze-sheen)' : 'var(--rule)';
+      tab.style.color = groupId === activeGroupId ? 'var(--bronze-sheen)' : 'var(--text-dim)';
+      tab.innerText = '#' + groupId.slice(0, 10);
+      tab.title = groupId;
+      tab.onclick = () => switchGroup(groupId);
+      container.appendChild(tab);
+    }
+    document.getElementById('group-copy-welcome-btn').disabled = !activeGroupId;
+  }
+
+  /** Show a group's feed in the shared chat area (pair/group views are exclusive). */
+  function switchGroup(groupId) {
+    activeGroupId = groupId;
+    activePeerPk = null;
+    // De-highlight pair tabs; highlight this group's tab.
+    document.querySelectorAll('.session-tab').forEach((t) => {
+      t.style.borderColor = 'var(--rule)';
+      t.style.color = 'var(--text-dim)';
+    });
+    renderAllGroupTabs();
+    const meta = groups.get(groupId);
+    const feed = document.getElementById('chat-feed');
+    if (meta && meta.feedEl) {
+      feed.innerHTML = '';
+      feed.appendChild(meta.feedEl);
+    } else {
+      showEmptyFeed('Group channel ready — send the first message.');
+    }
+    document.getElementById('chat-input').placeholder = 'Message the group (epoch-key encrypted, opaque to the relay)...';
+    updateGroupInfoBar();
+  }
+
+  function updateGroupInfoBar() {
+    if (!activeGroupId || !groups.has(activeGroupId)) return;
+    const meta = groups.get(activeGroupId);
+    const bar = document.getElementById('session-info-bar');
+    bar.style.display = 'flex';
+    document.getElementById('si-epoch').innerText = meta.session.epoch;
+    document.getElementById('si-msgs').innerText = meta.messages;
+    document.getElementById('si-size').innerText = meta.lastEnvSize > 0 ? meta.lastEnvSize.toLocaleString() : '-';
+    const tag = bar.querySelector('.rel-tag');
+    if (tag) tag.textContent = 'GROUP · EPOCH KEY · XSalsa20-Poly1305';
+  }
+
+  function renderGroupMessage(text, isSent, envSize, groupId, senderAddress) {
+    const meta = groups.get(groupId || activeGroupId);
+    if (!meta) return;
+    if (!meta.feedEl) {
+      meta.feedEl = document.createElement('div');
+      meta.feedEl.style.display = 'flex';
+      meta.feedEl.style.flexDirection = 'column';
+      meta.feedEl.style.gap = '10px';
+    }
+    const msgDiv = document.createElement('div');
+    msgDiv.style.cssText = `display:flex;flex-direction:column;align-items:${isSent ? 'flex-end' : 'flex-start'}`;
+    const bubble = document.createElement('div');
+    bubble.style.cssText = `max-width:80%;padding:12px 16px;border-radius:4px;font-family:'EB Garamond',serif;font-size:15px;line-height:1.4;color:var(--text-primary);background:${isSent ? 'var(--granite-surface)' : 'var(--granite-dark)'};border:1px solid ${isSent ? 'var(--bronze-mid)' : 'var(--rule)'}`;
+    // innerText only — the sender address is wire-controlled and must never
+    // reach the DOM as HTML (VULN-006 pattern); shortKey strips escape bytes.
+    bubble.innerText = text;
+    const stamp = document.createElement('div');
+    stamp.style.cssText = "font-family:'Cinzel',serif;font-size:9px;color:var(--text-dim);margin-top:4px;display:flex;gap:8px;align-items:center";
+    const who = isSent ? 'SENT' : 'RECEIVED';
+    const sender = (!isSent && senderAddress) ? shortKey(senderAddress).slice(0, 11) : '';
+    stamp.innerHTML = `
+      <span class="rel-tag ${isSent ? 'rel-support' : 'rel-neutral'}">${who}</span>
+      <span>Group · epoch ${meta.session.epoch}</span>
+      <span style="color:var(--cyan)">${envSize.toLocaleString()} bytes</span>
+    `;
+    // VULN-006: env.sender is wire-controlled (any group member can forge it —
+    // the AEAD nonce derives FROM the sender field, so a fake sender still
+    // decrypts), and shortKey strips controls but does NOT HTML-escape. It must
+    // never reach innerHTML; a created span + textContent renders it inert.
+    if (sender) {
+      const fromSpan = document.createElement('span');
+      fromSpan.style.color = 'var(--text-dim)';
+      fromSpan.textContent = 'from ' + sender;
+      stamp.appendChild(fromSpan);
+    }
+    msgDiv.appendChild(bubble);
+    msgDiv.appendChild(stamp);
+    meta.feedEl.appendChild(msgDiv);
+    if (groupId === activeGroupId) {
+      const feed = document.getElementById('chat-feed');
+      const empty = document.getElementById('chat-empty');
+      if (empty) empty.remove();
+      if (!feed.contains(meta.feedEl)) feed.appendChild(meta.feedEl);
+      feed.scrollTop = feed.scrollHeight;
+    }
+  }
+
+  /** A non-message line in a group's feed (e.g. a Commit ratcheting the epoch). */
+  function renderGroupSystemLine(text, groupId) {
+    const meta = groups.get(groupId || activeGroupId);
+    if (!meta) return;
+    if (!meta.feedEl) {
+      meta.feedEl = document.createElement('div');
+      meta.feedEl.style.cssText = 'display:flex;flex-direction:column;gap:10px';
+    }
+    const div = document.createElement('div');
+    div.style.cssText = "font-family:'Cinzel',serif;font-size:10px;color:var(--text-dim);padding:2px 16px;border-left:2px solid var(--bronze-mid)";
+    div.innerText = '🔄 ' + text;
+    meta.feedEl.appendChild(div);
+    if (groupId === activeGroupId) {
+      const feed = document.getElementById('chat-feed');
+      if (!feed.contains(meta.feedEl)) feed.appendChild(meta.feedEl);
+      feed.scrollTop = feed.scrollHeight;
+    }
+  }
+
+  /** Persist every group as its Welcome snapshot, secretbox-encrypted like sessions. */
+  function persistGroups() {
+    try {
+      const data = {};
+      for (const [gid, g] of groups) {
+        data[gid] = { welcome: g.session.makeWelcome(), messages: g.messages, lastEnvSize: g.lastEnvSize };
+      }
+      const key = sessionStoreKey();
+      const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
+      const box = sodium.crypto_secretbox_easy(new TextEncoder().encode(JSON.stringify(data)), nonce, key);
+      localStorage.setItem('e2ee_groups', JSON.stringify({
+        v: 1,
+        nonce: sodium.to_base64(nonce, sodium.base64_variants.ORIGINAL),
+        box: sodium.to_base64(box, sodium.base64_variants.ORIGINAL),
+      }));
+    } catch (err) {
+      console.error('[E2EE] failed to persist groups:', err);
+    }
+  }
+
+  /** Restore group channels from storage; the ws.onopen handler resubscribes. */
+  function loadGroupsFromStorage() {
+    try {
+      const raw = localStorage.getItem('e2ee_groups');
+      if (!raw) return;
+      const { nonce, box } = JSON.parse(raw);
+      const key = sessionStoreKey();
+      const plaintext = sodium.crypto_secretbox_open_easy(
+        sodium.from_base64(box, sodium.base64_variants.ORIGINAL),
+        sodium.from_base64(nonce, sodium.base64_variants.ORIGINAL),
+        key
+      );
+      if (!plaintext) return; // wrong key (identity rotated) or tampered
+      const data = JSON.parse(sodium.to_string(plaintext));
+      for (const [gid, meta] of Object.entries(data)) {
+        let g;
+        try { g = GroupSession.fromWelcome(meta.welcome, myAddress); }
+        catch { continue; } // malformed/tampered entry — skip, never trust storage
+        if (g.groupId !== gid) continue;
+        groups.set(gid, { session: g, messages: meta.messages || 0, lastEnvSize: meta.lastEnvSize || 0 });
+      }
+      if (groups.size > 0) renderAllGroupTabs();
+    } catch (err) {
+      console.error('[E2EE] failed to restore groups:', err);
+    }
+  }
+
   // ---- WebSocket + startup ----
 
   async function startE2EE() {
     sodium = await init();
+    useSodium(sodium); // group-core.js needs the same libsodium instance
     const unb64 = (s) => sodium.from_base64(s, sodium.base64_variants.ORIGINAL);
 
     const saved = localStorage.getItem('e2ee_identity');
@@ -4002,6 +4468,7 @@ function exportJSONLD() {
           // v4 -> v5 in-place migration: keep the routing address and signing
           // identity, generate the signed prekey + ML-KEM keypairs.
           console.log('[E2EE] Migrating v4 identity to v5 (signed prekey + ML-KEM-768)');
+          await loadPQ(); // fromLegacy generates an ML-KEM-768 keypair
           myId = Identity.fromLegacy(legacy);
           localStorage.removeItem('e2ee_sessions'); // ratchet roots differ in v5
         }
@@ -4010,30 +4477,22 @@ function exportJSONLD() {
         await generateNewE2EEIdentity();
         return;
       }
-      myPk = sodium.to_base64(myId.pk, sodium.base64_variants.ORIGINAL);
-      myAddress = sodium.to_base64(Identity.deriveAddress(myId.signPk, myId.pk), sodium.base64_variants.ORIGINAL);
-      // v5 -> v6: load the one-time prekey pool, then top it up. A v5
-      // identity has no pool field, so it silently gains one here.
-      if (data.oneTimePrekeys && typeof data.oneTimePrekeys === 'object') {
-        const otks = new Map();
-        for (const [otkId, kp] of Object.entries(data.oneTimePrekeys)) {
-          otks.set(Number(otkId), {
-            id: Number(otkId), sk: unb64(kp.dhSk), pk: unb64(kp.dhPk), signature: unb64(kp.signature),
-          });
-        }
-        myId.oneTimePrekeys = otks;
-      }
-      if (myId.oneTimePrekeys.size < OTK_POOL_SIZE) {
-        myId.newOneTimePrekeys(OTK_POOL_SIZE);
-        persistIdentity();
-      }
-      updateUIWithKeys();
+      await restoreIdentityFromData(data);
     } else {
       await generateNewE2EEIdentity();
     }
 
+    // Client-side memory (loopback Hindsight sidecar): derive the bank from the
+    // identity's address — the SAME derivation as the CLI (bv-<sha256(addr)>
+    // first 16 hex), so CLI and browser share one bank per identity. Best-effort
+    // and fire-and-forget: unreachable sidecar = memory off, chat unaffected.
+    initMemory().catch(console.error);
+
     // Restore persisted sessions so a reload does not desync the ratchet.
     loadSessionsFromStorage();
+    // Restore group channels (epoch key + membership come from each group's
+    // Welcome snapshot; resubscribe happens on ws.onopen).
+    loadGroupsFromStorage();
 
     // Restore the active session too, so post-reload messages decrypt into the
     // live feed instead of waiting for the user to re-click the tab. The key is
@@ -4055,10 +4514,12 @@ function exportJSONLD() {
     // at their own loopback relay instance. Restricted to loopback hosts: a
     // crafted URL must not be able to redirect the app to an attacker's relay
     // (metadata + ciphertext exposure, traffic injection).
-    const relayParam = new URLSearchParams(location.search).get('relay');
-    const relayUrl = relayParam && /^ws:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(relayParam)
-      ? relayParam
-      : 'ws://127.0.0.1:8080';
+    const relayParam = new URLSearchParams(location.search).get('relay');    // Relay allowlist: loopback may be ws:// or wss://; a REMOTE relay must be
+    // wss:// (plaintext to a remote host would expose the traffic). Falls back
+    // to the loopback dev default otherwise (fail closed).
+    const loopbackRelay = relayParam && /^wss?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/.test(relayParam);
+    const remoteSecureRelay = relayParam && /^wss:\/\/[^/\s]+(:\d+)?(\/|$)/.test(relayParam);
+    const relayUrl = (loopbackRelay || remoteSecureRelay) ? relayParam : 'ws://127.0.0.1:8080';
     ws = new WebSocket(relayUrl);
     const statusSpan = document.getElementById('relay-status');
 
@@ -4067,6 +4528,9 @@ function exportJSONLD() {
       statusSpan.style.color = 'var(--green)';
       try { await publishToRelay(); }
       catch (err) { console.error('[E2EE] registration failed:', err); }
+      // Group channels ride the same connection: re-bind every known group_id
+      // (restored groups included) so fan-out resumes after a reload.
+      resubscribeAllGroups();
     };
 
     ws.onclose = () => {
@@ -4076,7 +4540,7 @@ function exportJSONLD() {
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
-      if (msg.type === 'directory') {
+      if (msg.type === 'directory-shard') {
         if (pendingDirectoryResolve) {
           const r = pendingDirectoryResolve;
           pendingDirectoryResolve = null;
@@ -4086,12 +4550,58 @@ function exportJSONLD() {
         return;
       }
       if (msg.type === 'message') {
+        let env;
+        try { env = typeof msg.envelope === 'string' ? JSON.parse(msg.envelope) : msg.envelope; }
+        catch { console.error('[E2EE] undecodable envelope'); return; }
+
+        // Group-mode envelope (ROADMAP §7 prototype): the relay fans out by
+        // group_id but does NOT echo it back, so trial-decrypt across known
+        // groups — the epoch key authenticates, and a wrong-key open fails.
+        // Only a successful decrypt mutates state (replay guard + commits).
+        if (env && env.mode === 'group') {
+          let handled = false;
+          for (const [gid, g] of groups) {
+            try {
+              const r = g.session.handleIncoming(env);
+              const envSize = JSON.stringify(env).length;
+              if (r.commit) {
+                persistGroups();
+                updateGroupInfoBar();
+                renderGroupSystemLine('commit applied — epoch advanced to ' + g.session.epoch, gid);
+                handled = true;
+                break;
+              }
+              // The relay fans out to EVERY subscriber incl. the sender — a
+              // self-echo was already rendered on send; decrypt it (replay
+              // guard) but do not re-render or re-count.
+              if (env.sender === myAddress) { handled = true; break; }
+              g.messages++;
+              g.lastEnvSize = envSize;
+              persistGroups();
+              renderGroupMessage(r.text, false, envSize, gid, env.sender);
+              updateGroupInfoBar();
+              showToast('🔐 Encrypted group message from ' + shortKey(env.sender).slice(0, 11));
+              // Fire-and-forget memory, same pattern as pair traffic.
+              if (memory) {
+                memory.retain(r.text, { context: 'received-group', wait: true }).then(() => {
+                  return memory.recall(r.text);
+                }).then((rr) => {
+                  if (rr.ok && rr.results.length) renderMemoryHint(rr.results[0].text, rr.results[0].score, null, gid);
+                }).catch(() => {});
+              }
+              handled = true;
+              break;
+            } catch { /* wrong group / malformed — try the next one */ }
+          }
+          if (!handled) console.error('[E2EE] group envelope not decryptable by any known group (dropped)');
+          return;
+        }
+
         let senderPkB64 = null;
         let meta = null;
         let created = false;
         let senderAddress = null;
         try {
-          const env = typeof msg.envelope === 'string' ? JSON.parse(msg.envelope) : msg.envelope;
           senderPkB64 = env.senderDhPk;
           if (!senderPkB64) throw new Error('envelope has no senderDhPk (pre-v5 sender?)');
 
@@ -4101,26 +4611,30 @@ function exportJSONLD() {
           // key, so the pinned identity is coherent (TOFU first contact).
           if (!sessions.has(senderPkB64)) {
             if (!selfConsistent(env)) {
-              console.error('[E2EE] dropped self-inconsistent envelope from', senderPkB64.slice(0,16) + '...');
+              // VULN-006-equivalent: senderDhPk is wire-controlled (the relay
+              // validates it only as a non-empty string), so it MUST render
+              // through shortKey() — raw bytes could inject ANSI/OSC escapes
+              // or Trojan-Source bidi controls into the developer console.
+              console.error('[E2EE] dropped self-inconsistent envelope from', shortKey(senderPkB64));
               return;
             }
             if (env.header.first !== true || !env.header.bundle) {
-              console.error('[E2EE] dropped first contact without a prekey bundle from', senderPkB64.slice(0,16) + '...');
+              console.error('[E2EE] dropped first contact without a prekey bundle from', shortKey(senderPkB64));
               return;
             }
             let peer;
             try {
               peer = Identity.verifyBundle(env.header.bundle);
             } catch {
-              console.error('[E2EE] dropped envelope with invalid prekey bundle from', senderPkB64.slice(0,16) + '...');
+              console.error('[E2EE] dropped envelope with invalid prekey bundle from', shortKey(senderPkB64));
               return;
             }
             if (sodium.to_base64(peer.staticDhPk, sodium.base64_variants.ORIGINAL) !== senderPkB64 ||
                 sodium.to_base64(peer.signPk, sodium.base64_variants.ORIGINAL) !== env.senderSignPk) {
-              console.error('[E2EE] dropped envelope whose bundle does not match its signature from', senderPkB64.slice(0,16) + '...');
+              console.error('[E2EE] dropped envelope whose bundle does not match its signature from', shortKey(senderPkB64));
               return;
             }
-            console.log('[E2EE] New inbound session from:', senderPkB64.slice(0,16) + '...');
+            console.log('[E2EE] New inbound session from:', shortKey(senderPkB64));
             created = true;
             senderAddress = sodium.to_base64(Identity.deriveAddress(peer.signPk, peer.staticDhPk), sodium.base64_variants.ORIGINAL);
             // v6: if the sender consumed one of our one-time prekeys, derive
@@ -4134,6 +4648,9 @@ function exportJSONLD() {
               myId.oneTimePrekeys.delete(otk.id);
               persistIdentity();
             }
+            // PQ is already loaded here: the relay only delivers to registered
+            // addresses, and registration (publishToRelay) awaits loadPQ()
+            // before sending its signed bundle.
             const sess = new Session(myId, env.header.bundle, peerOtk);
             sessions.set(senderPkB64, { session: sess, messages: 0, epoch: 0, lastEnvSize: 0 });
             renderAllSessionTabs();
@@ -4153,7 +4670,7 @@ function exportJSONLD() {
           // hand (closes the bootstrap crash-recovery edge).
           if (created && senderAddress) {
             const receiptEnv = meta.session.encrypt(new TextEncoder().encode(RECEIPT));
-            ws.send(JSON.stringify({ type: 'send', toPk: senderAddress, envelope: receiptEnv, fromPk: myAddress }));
+            ws.send(JSON.stringify({ type: 'send', toPk: senderAddress, envelope: receiptEnv }));
           }
 
           if (!isReceipt(plaintext)) {
@@ -4161,7 +4678,19 @@ function exportJSONLD() {
             meta.lastEnvSize = envSize;
             renderMessage(plaintext, false, envSize, senderPkB64);
             updateSessionInfoBar();
-            showToast(`🔐 Encrypted message received from ${senderPkB64.slice(0,8)}...`);
+            showToast(`🔐 Encrypted message received from ${shortKey(senderPkB64).slice(0, 11)}`);
+            // Fire-and-forget memory: retain what we received (wait:true so the
+            // chained recall below sees it indexed), then surface related
+            // memories as a hint line in the feed. Never awaited, never throws.
+            if (memory) {
+              memory.retain(plaintext, { context: 'received', wait: true }).then(() => {
+                return memory.recall(plaintext);
+              }).then((r) => {
+                if (r.ok && r.results.length) {
+                  renderMemoryHint(r.results[0].text, r.results[0].score, senderPkB64);
+                }
+              }).catch(() => {});
+            }
           }
           saveSessionsToStorage();
         } catch (err) {
@@ -4174,89 +4703,120 @@ function exportJSONLD() {
       }
     };
 
-    window.uiSendE2EEMessage = async () => {
-      const raw = document.getElementById('peer-key-input').value.trim();
-      const text = document.getElementById('chat-input').value.trim();
-      if (!raw || !text) { showToast('Enter a peer bundle or address and a message.'); return; }
-      // The bootstrap runs on idle time; bring it up on demand if the user
-      // acts before it has finished.
-      if (!(await whenE2EEReady())) return;
-      await loadPQ(); // session establish/encrypt needs ML-KEM-768
+  }
 
-      let peer;
-      let peerOtk = null;
-      let toPkBase64;
-      let toAddress;
-      if (raw.length === 44) {
-        // Address mode: resolve the bundle + one-time prekey from the key
-        // directory (removes TOFU for the bootstrap).
-        try {
-          const dir = await fetchDirectory(raw);
-          const verified = Identity.verifyBundle(dir.bundle);
-          peer = { bundle: dir.bundle };
-          toPkBase64 = sodium.to_base64(verified.staticDhPk, sodium.base64_variants.ORIGINAL);
-          toAddress = raw;
-          if (dir.oneTimePrekey) {
-            if (!Identity.verifyOneTimePrekey(verified.signPk, dir.oneTimePrekey)) throw new Error('directory served a bad one-time prekey');
-            peerOtk = dir.oneTimePrekey;
-          }
-        } catch (err) {
-          showToast('⚠️ Directory lookup failed — ' + err.message);
-          return;
-        }
-      } else {
-        peer = canonicalPeerBundle(raw);
-        if (!peer) { showToast('⚠️ Not a valid v6 prekey bundle or address'); return; }
-        toPkBase64 = peer.b64;
-        toAddress = peer.address;
-      }
-      if (toPkBase64 === sodium.to_base64(myId.pk, sodium.base64_variants.ORIGINAL)) {
-        showToast('That is your own key.');
-        return;
-      }
+  // ---- Send / open paths (gated on the deferred E2EE bootstrap) ----
 
+  window.uiSendE2EEMessage = async () => {
+    const raw = document.getElementById('peer-key-input').value.trim();
+    const text = document.getElementById('chat-input').value.trim();
+    if (!text) { showToast('Enter a message first.'); return; }
+
+    // The bootstrap runs on idle time; bring it up on demand if the user acts
+    // before it has finished.
+    if (!(await whenE2EEReady())) return;
+
+    // Group channel active: encrypt under the epoch key and route by group_id
+    // (the relay treats a group as just another address, fanning out to
+    // subscribers — no pair-session machinery involved).
+    if (activeGroupId && groups.has(activeGroupId)) {
+      const g = groups.get(activeGroupId);
       try {
-        if (!sessions.has(toPkBase64)) {
-          // Either side may send the first message — no initiator role.
-          const sess = new Session(myId, peer.bundle, peerOtk);
-          sessions.set(toPkBase64, { session: sess, messages: 0, epoch: 0, lastEnvSize: 0 });
-          switchSession(toPkBase64); // persists the active peer + fills the live feed
-          renderAllSessionTabs();
-        }
-
-        const meta = sessions.get(toPkBase64);
-        const envelope = meta.session.encrypt(new TextEncoder().encode(text));
+        const envelope = g.session.encrypt(text);
         const envSize = JSON.stringify(envelope).length;
-        meta.messages++;
-        meta.lastEnvSize = envSize;
-        // Persist the ratchet state BEFORE the send is observable: a crash after
-        // the send must not leave a session that re-flags as `first` on restore.
-        saveSessionsToStorage();
-        ws.send(JSON.stringify({ type: 'send', toPk: toAddress, envelope, fromPk: myAddress }));
-
-        renderMessage(text, true, envSize, toPkBase64);
-        updateSessionInfoBar();
+        g.messages++;
+        g.lastEnvSize = envSize;
+        persistGroups();
+        ws.send(JSON.stringify({ type: 'send', toPk: g.session.groupId, envelope }));
+        renderGroupMessage(text, true, envSize, g.session.groupId);
+        updateGroupInfoBar();
         document.getElementById('chat-input').value = '';
+        if (memory) memory.retain(text, { context: 'sent-group' });
       } catch (err) {
-        console.error('[E2EE] Send error:', err);
+        console.error('[E2EE] Group send error:', err);
         showToast('⚠️ ' + err.message);
       }
-    };
+      return;
+    }
 
-    // Enter key sends message
-    document.getElementById('chat-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); uiSendE2EEMessage(); }
-    });
-  }
+    if (!raw) { showToast('Enter a peer bundle or address and a message.'); return; }
+    // Session establishment (bundle verification + ML-KEM encapsulation) is
+    // the first real PQ use on the send side — fetch it now if the deferred
+    // bootstrap has not already via registration.
+    await loadPQ();
+
+    let peer;
+    let peerOtk = null;
+    let toPkBase64;
+    let toAddress;
+    if (raw.length === 44) {
+      // Address mode: resolve the bundle + one-time prekey from the key
+      // directory (removes TOFU for the bootstrap).
+      try {
+        const dir = await fetchDirectory(raw);
+        const verified = Identity.verifyBundle(dir.bundle);
+        peer = { bundle: dir.bundle };
+        toPkBase64 = sodium.to_base64(verified.staticDhPk, sodium.base64_variants.ORIGINAL);
+        toAddress = raw;
+        if (dir.oneTimePrekey) {
+          if (!Identity.verifyOneTimePrekey(verified.signPk, dir.oneTimePrekey)) throw new Error('directory served a bad one-time prekey');
+          peerOtk = dir.oneTimePrekey;
+        }
+      } catch (err) {
+        showToast('⚠️ Directory lookup failed — ' + err.message);
+        return;
+      }
+    } else {
+      peer = canonicalPeerBundle(raw);
+      if (!peer) { showToast('⚠️ Not a valid v6 prekey bundle or address'); return; }
+      toPkBase64 = peer.b64;
+      toAddress = peer.address;
+    }
+    if (toPkBase64 === sodium.to_base64(myId.pk, sodium.base64_variants.ORIGINAL)) {
+      showToast('That is your own key.');
+      return;
+    }
+
+    try {
+      if (!sessions.has(toPkBase64)) {
+        // Either side may send the first message — no initiator role.
+        const sess = new Session(myId, peer.bundle, peerOtk);
+        sessions.set(toPkBase64, { session: sess, messages: 0, epoch: 0, lastEnvSize: 0 });
+        switchSession(toPkBase64); // persists the active peer + fills the live feed
+        renderAllSessionTabs();
+      }
+
+      const meta = sessions.get(toPkBase64);
+      const envelope = meta.session.encrypt(new TextEncoder().encode(text));
+      const envSize = JSON.stringify(envelope).length;
+      meta.messages++;
+      meta.lastEnvSize = envSize;
+      // Persist the ratchet state BEFORE the send is observable: a crash after
+      // the send must not leave a session that re-flags as `first` on restore.
+      saveSessionsToStorage();
+      ws.send(JSON.stringify({ type: 'send', toPk: toAddress, envelope }));
+
+      renderMessage(text, true, envSize, toPkBase64);
+      updateSessionInfoBar();
+      document.getElementById('chat-input').value = '';
+      // Fire-and-forget memory: retain what we sent (same context tag as the
+      // CLI, so a shared bank merges cleanly). Never awaited, never throws.
+      if (memory) memory.retain(text, { context: 'sent' });
+    } catch (err) {
+      console.error('[E2EE] Send error:', err);
+      showToast('⚠️ ' + err.message);
+    }
+  };
+
+  // Enter key sends message
+  document.getElementById('chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); uiSendE2EEMessage(); }
+  });
 
   // Defer the expensive E2EE bootstrap (libsodium ready-wait + keygen + relay
   // connect) to idle time so first paint and interactivity are not blocked.
   // The timeout guarantees it still runs on busy pages; send/open await it
   // through whenE2EEReady() anyway.
-  if (typeof requestIdleCallback === 'function') {
-    requestIdleCallback(() => { ensureE2EE().catch(console.error); }, { timeout: 5000 });
-  } else {
-    setTimeout(() => { ensureE2EE().catch(console.error); }, 0);
-  }
+  deferBoot(ensureE2EE);
 </script>
 </body>
