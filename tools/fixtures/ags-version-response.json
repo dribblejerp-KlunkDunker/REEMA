@@ -1,0 +1,12 @@
+{
+  "versions": {
+    "agentskill-sh/learn": {
+      "contentSha": "e6b59a3",
+      "updatedAt": "2026-08-20T08:12:52.964Z"
+    },
+    "sametcelikbicak/coverage-guard": {
+      "contentSha": "aff0543",
+      "updatedAt": "2026-08-20T03:12:13.110Z"
+    }
+  }
+}
