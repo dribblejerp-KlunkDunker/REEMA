@@ -3,7 +3,7 @@ import { connect } from 'node:net';
 import { init, Identity, Session, loadPQ } from './crypto.js';
 import { GroupSession, useSodium } from '../public/group-core.js';
 import { generateVaultIdentity, exportVault, importVault } from './vault.js';
-import { stripControls, shortKey } from './sanitize.js';
+import { stripControls, shortKey, normalizeConfusables, sanitizedLogger } from './sanitize.js';
 
 /**
  * Integration test: full E2EE messaging through the REAL relay (protocol v6).
@@ -21,6 +21,9 @@ import { stripControls, shortKey } from './sanitize.js';
  *     regression: non-string senderSignPk/pq_pk/pq_ct must reject, not kill)
  *   - the relay sanitizes control characters in logged keys/addresses, so a
  *     crafted toPk cannot inject terminal escape sequences into its console
+ *   - the relay also NORMALIZES homoglyph confusables (Cyrillic/Greek
+ *     lookalikes) in logged keys/addresses, so a crafted routing key cannot
+ *     spoof a known address in the operator console
  *   - the shared stripControls() strips control bytes from peer message
  *     plaintext in the CLI client, so decrypted text cannot inject escapes
  */
@@ -163,6 +166,66 @@ async function main() {
     assert('shortKey returns <invalid> for non-strings',
       shortKey(null) === '<invalid>' && shortKey(42) === '<invalid>' && shortKey(undefined) === '<invalid>');
     assert('shortKey keeps printable payload text', rendered.includes('A'));
+  }
+
+  // ---- Homoglyph confusable normalization (VULN-005 extension): a routing
+  // key written with Cyrillic/Greek lookalikes (U+0430 'а' for 'a', U+03BF
+  // 'ο' for 'o') renders identically to the genuine ASCII address in the
+  // operator console, so an attacker could spoof "message from <known
+  // address>" or a group id. normalizeConfusables() maps lookalikes to their
+  // ASCII bases from the full Unicode confusables dataset; shortKey() applies
+  // it BEFORE slicing. (The end-to-end relay sink is covered below.)
+  {
+    console.log('=== Homoglyph confusable normalization ===');
+    // а->a р->p е->e с->c  (Cyrillic lookalikes)
+    assert('maps Cyrillic lookalikes to ASCII bases', normalizeConfusables('арес') === 'apec');
+    // ν->v ο->o  (Greek lookalikes)
+    assert('maps Greek lookalikes to ASCII bases', normalizeConfusables('νο') === 'vo');
+    // U+212A KELVIN SIGN -> K, U+212B ANGSTROM SIGN -> A (letterlike forms)
+    assert('maps letterlike forms to ASCII bases', normalizeConfusables('K') === 'K' && normalizeConfusables('Å') === 'A');
+    // U+24FE NEGATIVE CIRCLED NUMBER TEN -> '10' (multi-char base)
+    assert('expands multi-char bases', normalizeConfusables('⓾') === '10');
+    // The dataset's ASCII keys ('|' -> 'l', '1' -> '1', ' ' -> ' ') are
+    // filtered: a pipe is not a homoglyph attack and must never be rewritten.
+    assert('leaves ASCII untouched (pipe is not a homoglyph)',
+      normalizeConfusables('plain | text 123') === 'plain | text 123');
+    assert('leaves non-strings alone', normalizeConfusables(undefined) === undefined && normalizeConfusables(42) === 42);
+    const spoof = 'а'.repeat(30);
+    assert('shortKey normalizes a Cyrillic-lookalike key to ASCII',
+      shortKey(spoof) === 'a'.repeat(16) + '...');
+    assert('shortKey output is pure ASCII for lookalike input', !/[^\x00-\x7f]/.test(shortKey(spoof)));
+    assert('shortKey keeps genuine ASCII keys byte-for-byte',
+      shortKey('A'.repeat(20)) === 'A'.repeat(16) + '...');
+    console.log(`[test] normalized: ${JSON.stringify(normalizeConfusables('арес νο'))}`);
+  }
+
+  // ---- Sink-level sanitized logger (--sanitize-log / RELAY_SANITIZE_LOG):
+  // the relay can route EVERY line it writes through stripControls() —
+  // defense-in-depth so a future call site that forgets the per-field
+  // short()/stripControls() discipline still cannot emit a control
+  // character. The main relay spawn below runs with the mode on, so the
+  // suite's end-to-end "relay log is control-free" assertions double as the
+  // integration proof.
+  {
+    console.log('=== Sink-level sanitized logger (--sanitize-log) ===');
+    const captured = [];
+    const fake = {
+      log: (...a) => captured.push(['log', ...a]),
+      error: (...a) => captured.push(['error', ...a]),
+      warn: (...a) => captured.push(['warn', ...a]),
+    };
+    const safe = sanitizedLogger(fake);
+    safe.log('[server] raw ' + '\x1b[2J' + ' value');
+    safe.error('bad arg:', '\x1b]8;;https://evil.example\x1b\\' + 'payload');
+    safe.warn('\u202e' + 'spoofed');
+    safe.log('count:', 42, null);
+    assert('strips controls from every logger line',
+      !captured.flat().some((v) => typeof v === 'string' && /[\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(v)));
+    assert('keeps the printable log text', captured[0][1].includes('raw') && captured[0][1].includes('value'));
+    assert('covers log, error, and warn sinks',
+      captured[0][0] === 'log' && captured[1][0] === 'error' && captured[2][0] === 'warn');
+    assert('leaves non-string args untouched', captured[3][1] === 'count:' && captured[3][2] === 42 && captured[3][3] === null);
+    console.log('[test] sanitized logger: ' + captured.map((c) => c.join(' ')).join(' | '));
   }
 
   // ---- Vault-at-rest (age format) round-trips ----

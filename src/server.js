@@ -1,7 +1,7 @@
 import { createServer } from 'node:net';
 import { WebSocketServer } from 'ws';
 import { init, Identity, loadPQ } from './crypto.js';
-import { stripControls } from './sanitize.js';
+import { stripControls, shortKey } from './sanitize.js';
 
 /**
  * Ciphertext-only relay + key directory (protocol v6).
@@ -76,16 +76,16 @@ const directory = new Map();
 const groups = new Map();
 let sodium = null; // bound by init() before the servers listen
 
-// Sanitize control characters before echoing a key/address into the operator's
-// console. The `send` path accepts an arbitrary non-empty string as `toPk`
-// (the relay treats it as an opaque routing key), so a crafted value could
-// otherwise inject ANSI/OSC terminal escape sequences into the log (VULN-005)
-// or reorder/hide text via Unicode bidi/format controls (Trojan-Source).
-// stripControls() strips both; the slice keeps the log line short.
-const short = (pk) => {
-  if (typeof pk !== 'string') return '<invalid>';
-  return stripControls(pk).slice(0, 16) + '...';
-};
+// Sanitize control characters and homoglyph lookalikes before echoing a
+// key/address into the operator's console. The `send` path accepts an
+// arbitrary non-empty string as `toPk` (the relay treats it as an opaque
+// routing key), so a crafted value could otherwise inject ANSI/OSC terminal
+// escape sequences into the log (VULN-005), reorder/hide text via Unicode
+// bidi/format controls (Trojan-Source), or spoof a known address with
+// Cyrillic/Greek lookalikes. shortKey() strips the controls, normalizes the
+// confusables to ASCII, and slices to a short display form — one shared
+// implementation, so the relay log path can never drift from the client's.
+const short = shortKey;
 
 function isAlive(client) {
   if (!client) return false;
